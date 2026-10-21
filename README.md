@@ -116,7 +116,7 @@ This should print: nuScenes map loaded successfully
 
 #### 1.2.2 Verifier Environment
 ```bash
-cd ~/formal-verification-workspace
+cd $HOME/formal-verification-workspace
 ```
 Install `uv` if it is not already installed.
 
@@ -162,6 +162,14 @@ Add the correct package parent directory to `PYTHONPATH`:
 ```bash
 export PYTHONPATH="$HOME/formal-verification-workspace/alpha-beta-CROWN/auto_LiRPA:$PYTHONPATH"
 ```
+
+#### 1.2.3 Prior Verification
+Clone repository `strive-prior-verification` on the directory `formal-verification-workspace`
+```bash
+cd $HOME/formal-verification-workspace/
+git clone https://github.com/anita00001/strive-prior-verification.git
+```
+---
 
 ### 1.3 Capture STRIVE internal activation
 
