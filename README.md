@@ -465,22 +465,29 @@ python verify_prior_stage_d1_generalized_all_agents.py \
 ```
 ---
 
-### 4.1.2 Run D2 verifier
+### 4.4.2 Run D2 verifier
+1. Target map 1-pixel D2 verifier
 ```bash
-cd $HOME/formal-verification-workspace/strive-prior-verification
-
-export PYTHONPATH="$HOME/formal-verification-workspace/alpha-beta-CROWN/auto_LiRPA:$PYTHONPATH"
+python verify_prior_stage_d2.py \
+  --ckpt $HOME/formal-verification-workspace/STRIVE/model_ckpt/traffic_model.pth \
+  --capture $HOME/formal-verification-workspace/strive-prior-verification/prior_stage_d_capture.pt \
+  --epsilon 0.0001 \
+  --delta 0.05 \
+  --max-depth 0 \
+  --max-nodes 1 \
+  --threads 8
 ```
+2. Target map 3x3 patch D2 verifier
 ```bash  
-python verify_prior_stage_d2_generalized_patch_late_crown.py \
-    --ckpt $HOME/formal-verification-workspace/STRIVE/model_ckpt/traffic_model.pth \
-    --capture $HOME/formal-verification-workspace/strive-prior-verification/prior_stage_d_capture.pt \
-    --epsilon 0.001 \
-    --delta 0.05 \
-    --row 127 --col 127 --patch-size 3 \
-    --epsilon 0.0001 --delta 0.05 \
-    --max-depth 0 --max-nodes 1 --threads 8 \
-    --map-spec-batch 8 --selected-pair-count 64
+python verify_prior_stage_d2_generalized.py \
+  --ckpt $HOME/formal-verification-workspace/STRIVE/model_ckpt/traffic_model.pth \
+  --capture $HOME/formal-verification-workspace/strive-prior-verification/prior_stage_d_capture.pt \
+  --epsilon 0.0001 \
+  --delta 0.05 \
+  --patch-size 3 \
+  --max-depth 0 \
+  --max-nodes 1 \
+  --threads 8
 ```
 
 ## 7. Future extension
