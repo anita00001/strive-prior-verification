@@ -444,17 +444,28 @@ python verify_prior_stage_c_all_agents.py \
 ### 4.4 Verify Stage D
 Run:
 ### 4.4.1 Run verifier: D1
+1. Target only D1 verifier
+```bash
+python verify_prior_stage_d1.py \
+    --ckpt $HOME/formal-verification-workspace/STRIVE/model_ckpt/traffic_model.pth \
+    --capture $HOME/formal-verification-workspace/strive-prior-verification/prior_stage_d_capture.pt \
+    --epsilon 0.001 \
+    --delta 0.05 \
+    --method backward
+```
+2. Generalized D1 verifier
 ```bash
 python verify_prior_stage_d1_generalized_all_agents.py \
     --ckpt $HOME/formal-verification-workspace/STRIVE/model_ckpt/traffic_model.pth \
-    --c-capture $HOME/formal-verification-workspace/strive-prior-verification/prior_stage_c_capture.pt \
-    --d1-all-capture $HOME/formal-verification-workspace/strive-prior-verification/prior_stage_d1_all_capture.pt \
-    --old-d-capture $HOME/formal-verification-workspace/strive-prior-verification/prior_stage_d_capture.pt \
+    --capture $HOME/formal-verification-workspace/strive-prior-verification/prior_stage_d_capture.pt \
     --epsilon 0.001 \
-    --delta 0.05
+    --delta 0.05 \
+    --method backward \
+    --threads 8
 ```
+---
 
-### 6.2 Run D2 verifier
+### 4.1.2 Run D2 verifier
 ```bash
 cd $HOME/formal-verification-workspace/strive-prior-verification
 
