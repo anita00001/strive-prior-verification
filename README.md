@@ -4,7 +4,10 @@ This README gives a workflow for starting formal verification of the **STRIVE le
 
 ---
 
-## 1. Workspace and Environment setup
+## 1. Workspace and Environment Setup
+STRIVE Environment: strive
+alpha-beta-CROWN Environment: abcrown
+
 ### 1.1 Create a formal verification workspace
 ```bash
 mkdir formal-verification-workspace
@@ -42,7 +45,7 @@ git clone https://github.com/nv-tlabs/STRIVE.git
 cd STRIVE
 ```
 
-Activate environment for STRIVE:
+Activate the environment for STRIVE:
 
 ```bash
 conda create -n strive python=3.8 -y
@@ -62,6 +65,10 @@ python -m pip install --upgrade pip==24.2
 Install numpy
 ```bash
 pip install numpy==1.19.5
+```
+Install Shapely
+```bash
+python -m pip install "shapely==1.8.5.post1"
 ```
 Install other dependencies
 ```bash
@@ -140,6 +147,12 @@ uv sync
 source .venv/bin/activate
 ```
 
+Check Python availability.
+```bash
+which python
+python --version
+```
+
 Install auto_LiRPA inside the α,β-CROWN environment:
 
 ```bash
@@ -169,219 +182,258 @@ Clone repository `strive-prior-verification` on the directory `formal-verificati
 cd $HOME/formal-verification-workspace/
 git clone https://github.com/anita00001/strive-prior-verification.git
 ```
----
-
-### 1.3 Capture STRIVE internal activation
-
-If the machine GPU is much newer than the original PyTorch 1.9/CUDA 11.1 stack, use CPU for this capture step:
-
-```bash
-CUDA_VISIBLE_DEVICES="" python src/test_traffic.py \
-    --config ./configs/test_traffic.cfg \
-    --ckpt ./model_ckpt/traffic_model.pth
-```
-This is sufficient because the goal is only to capture an internal activation.
-
----
-
-## 2. Helper setup
-### Add the capture helper
-
-```bash
-cd formal-verification-workspace
-git clone strive-prior-verification
-```
-
 Add its directory to `PYTHONPATH`:
-
 ```bash
 export PYTHONPATH="$HOME/formal-verification-workspace/strive-prior-verification:$PYTHONPATH"
 ```
----
 
-## 3. Verify Stage A
-### 3.1 Attach the capture hook
-
-In STRIVE, open `src/test_traffic.py` and locate `model.eval()`
-Immediately below `model.eval()`, before `with torch.no_grad():`, temporarily add:
-
-```python
-from capture_prior_head import attach_capture
-
-attach_capture(
-    model,
-    "prior_head_capture.pt"
-)
-```
-Then run:
+#### 1.2.4 Create a shell script
+In the `STRIVE` root, create `run_prior_capture.sh`
 ```bash
-CUDA_VISIBLE_DEVICES="" python src/test_traffic.py \
+#!/bin/bash
+set -e
+
+cd ~/formal-verification-workspace/STRIVE
+
+export PYTHONPATH="$PWD/../strive-prior-verification:$PYTHONPATH"
+export CUDA_VISIBLE_DEVICES=""
+
+python src/test_traffic.py \
     --config ./configs/test_traffic.cfg \
     --ckpt ./model_ckpt/traffic_model.pth
 ```
+---
 
-The run should create:
-
-```text
-prior_head_capture.pt
+## 3. Capture Hook
+Check environment: It should be `strive`
+```bash
+cd $HOME/formal-verification-workspace/STRIVE
+conda activate strive
 ```
+
+### 3.1 Attach the capture hook for Stage A
+1. In STRIVE, open `src/test_traffic.py` and locate `model.eval()`
+Immediately below `model.eval()`, before `with torch.no_grad():`, temporarily add:
+
+```bash
+    from capture_prior_head import attach_capture
+
+    attach_capture(
+        model,
+        os.path.expanduser(
+            "~/formal-verification-workspace/strive-prior-verification/prior_head_capture.pt"
+        )
+    )
+```
+2. Run
+```bash
+bash run_prior_capture.sh
+```
+The run should create `prior_head_capture.pt` in the `strive-prior-verification` directory.
 
 ---
 
-### 3.2 Verify Prior output MLP only
+### 3.2 Attach the capture hook for Stage B
+1. In STRIVE, open `src/test_traffic.py` and locate `model.eval()`
+Immediately below `model.eval()`, before `with torch.no_grad():`, temporarily replace the old capture call with:
+```bash
+    # from capture_prior_head import attach_capture
+
+    # attach_capture(
+    #     model,
+    #     os.path.expanduser(
+    #         "~/formal-verification-workspace/strive-prior-verification/prior_head_capture.pt"
+    #     )
+    # )
+
+    from capture_prior_stage_b import attach_stage_b_capture
+
+    attach_stage_b_capture(
+        model,
+        os.path.expanduser(
+            "~/formal-verification-workspace/strive-prior-verification/stage_b_capture.pt"
+        )
+    )
+```
+2. Run
+```bash
+bash run_prior_capture.sh
+```
+The run should create `prior_stage_b_capture.pt` in the `strive-prior-verification` directory.
+
+---
+
+### 3.3 Attach the capture hook for Stage C
+1. In STRIVE, open `src/test_traffic.py` and locate `model.eval()`
+Immediately below `model.eval()`, before `with torch.no_grad():`, temporarily replace the old capture call with:
 
 ```bash
-cd ../formal-verification-workspace/strive-prior-verification
+
+    # from capture_prior_head import attach_capture
+
+    # attach_capture(
+    #     model,
+    #     os.path.expanduser(
+    #         "~/formal-verification-workspace/strive-prior-verification/prior_head_capture.pt"
+    #     )
+    # )
+
+    # from capture_prior_stage_b import attach_stage_b_capture
+
+    # attach_stage_b_capture(
+    #     model,
+    #     os.path.expanduser(
+    #         "~/formal-verification-workspace/strive-prior-verification/stage_b_capture.pt"
+    #     )
+    # )
+
+    from capture_prior_stage_c import attach_stage_c_capture
+
+    attach_stage_c_capture(
+        model,
+        os.path.expanduser(
+             "~/formal-verification-workspace/strive-prior-verification/prior_stage_c_capture.pt"
+        )
+    )
+```
+2. Run
+```bash
+bash run_prior_capture.sh
+```
+The run should create `prior_stage_c_capture.pt` in the `strive-prior-verification` directory.
+
+---
+
+### 3.3 Attach the capture hook for Stage C
+1. In STRIVE, open `src/test_traffic.py` and locate `model.eval()`
+Immediately below `model.eval()`, before `with torch.no_grad():`, temporarily replace the old capture call with:
+
+```bash
+    # from capture_prior_head import attach_capture
+
+    # attach_capture(
+    #     model,
+    #     os.path.expanduser(
+    #         "~/formal-verification-workspace/strive-prior-verification/prior_head_capture.pt"
+    #     )
+    # )
+
+    # from capture_prior_stage_b import attach_stage_b_capture
+
+    # attach_stage_b_capture(
+    #     model,
+    #     os.path.expanduser(
+    #         "~/formal-verification-workspace/strive-prior-verification/stage_b_capture.pt"
+    #     )
+    # )
+
+    # from capture_prior_stage_c import attach_stage_c_capture
+
+    # attach_stage_c_capture(
+    #     model,
+    #     os.path.expanduser(
+    #          "~/formal-verification-workspace/strive-prior-verification/prior_stage_c_capture.pt"
+    #     )
+    # )
+
+    from capture_prior_stage_d import attach_stage_d_capture
+
+    attach_stage_d_capture(
+        model,
+         os.path.expanduser(
+              "~/formal-verification-workspace/strive-prior-verification/prior_stage_d_capture.pt"
+        )
+    )
+```
+2. Run
+```bash
+bash run_prior_capture.sh
+```
+The run should create `prior_stage_d_capture.pt` in the `strive-prior-verification` directory.
+
+---
+---
+
+## 4. Verify STRIVE Traffic Prior: Interaction Network
+Check environment: It should be `abcrown`.
+```bash
+cd $HOME/formal-verification-workspace/alpha-beta-CROWN
+```
+Deactivate all other environments
+```bash
+conda deactivate
+```
+Activate `abcrown` environment
+```bash
+source .venv/bin/activate
+```
+Change directory to `strive-prior-verification`
+```bash
+cd $HOME/formal-verification-workspace/strive-prior-verification
+
+export PYTHONPATH="$HOME/formal-verification-workspace/alpha-beta-CROWN/auto_LiRPA:$HOME/formal-verification-workspace/alpha-beta-CROWN"
+```
+```bash
+python -c "import auto_LiRPA; print(auto_LiRPA.__file__); from auto_LiRPA import BoundedModule, BoundedTensor, PerturbationLpNorm; print('SUCCESS')"
+```
+---
+
+### 4.1 Stage A: Verify Prior output MLP only
+1. Run verifier
+```bash
+cd $HOME/formal-verification-workspace/strive-prior-verification
 
 python verify_prior_head.py \
     --ckpt $HOME/formal-verification-workspace/STRIVE/model_ckpt/traffic_model.pth \
-    --capture $HOME/formal-verification-workspace/STRIVE/prior_head_capture.pt \
+    --capture $HOME/formal-verification-workspace/strive-prior-verification/prior_head_capture.pt \
     --epsilon 0.001 \
     --delta 0.05
 ```
 
-Verify all 64 outputs of the output MLP
-
+2. Verify all 64 outputs of the output MLP
 ```bash
+cd $HOME/formal-verification-workspace/strive-prior-verification
+
 python verify_prior_head_all.py \
     --ckpt $HOME/formal-verification-workspace/STRIVE/model_ckpt/traffic_model.pth \
-    --capture $HOME/formal-verification-workspace/STRIVE/prior_head_capture.pt \
+    --capture $HOME/formal-verification-workspace/strive-prior-verification/prior_head_capture.pt \
     --epsilon 0.001 \
     --delta 0.05
 ```
 ---
 
-## 4. Verify Stage B
-```bash
-conda activate strive
-
-export PYTHONPATH="$HOME/formal-verification-workspace/strive-prior-verification:$PYTHONPATH"
-```
-In `src/test_traffic.py`, temporarily replace the old capture call with:
-```bash
-# from capture_prior_head import attach_capture
-
-# attach_capture(model, "prior_head_capture.pt")
-
-from capture_prior_stage_b import 
-
-attach_stage_b_captureattach_stage_b_capture( model, "prior_stage_b_capture.pt")
-```
-Run:
-```bash
-cd $HOME/formal-verification-workspace/STRIVE
-
-CUDA_VISIBLE_DEVICES="" python src/test_traffic.py \
-    --config ./configs/test_traffic.cfg \
-    --ckpt ./model_ckpt/traffic_model.pth
-```
+### 4.2 Verify Stage B
 Run Stage B Verification
-```bash
-cd $HOME/formal-verification-workspace/alpha-beta-CROWN
-source .venv/bin/activate
-
-export PYTHONPATH="$HOME$/formal-verification-workspace/alpha-beta-CROWN/auto_LiRPA:$PYTHONPATH"
-```
-
 ```bash
 cd $HOME/formal-verification-workspace/strive-prior-verification
 python verify_prior_stage_b.py \
     --ckpt $HOME/formal-verification-workspace/STRIVE/model_ckpt/traffic_model.pth \
-    --capture $HOME/formal-verification-workspace/STRIVE/prior_stage_b_capture.pt \
+    --capture $HOME/formal-verification-workspace/strive-prior-verification/prior_stage_b_capture.pt \
     --epsilon 0.001 \
     --delta 0.05
 ```
 ---
 
-## 5. Verify Stage C
-In STRIVE `src/test_traffic.py` add capture code
-```bash
-# from capture_prior_head import attach_capture
-
-# attach_capture(model, "prior_head_capture.pt")
-
-# from capture_prior_stage_b import attach_stage_b_capture
-
-# attach_stage_b_capture(model, "prior_stage_b_capture.pt")
-
-from capture_prior_stage_c import attach_stage_c_capture
-
-attach_stage_c_capture(model, "prior_stage_c_capture.pt")
-```
-Execute:
-```bash
-cd $HOME/formal-verification-workspace/STRIVE
-
-export PYTHONPATH="$HOME/formal-verification-workspace/strive-prior-quickstart:$PYTHONPATH"
-
-CUDA_VISIBLE_DEVICES="" ~/miniconda3/envs/strive/bin/python \
-src/test_traffic.py \
-    --config ./configs/test_traffic.cfg \
-    --ckpt ./model_ckpt/traffic_model.pth
-```
-
-Run the stage-c verifier
-```bash
-cd $HOME/formal-verification-workspace/strive_prior_quickstart
-
-export PYTHONPATH="HOME/formal-verification-workspace/alpha-beta-CROWN/auto_LiRPA:$PYTHONPATH"
-```
+### 4.3 Verify Stage C
 ```bash
 cd $HOME/formal-verification-workspace/strive-prior-verification
 python verify_prior_stage_c_all_agents.py \
     --ckpt $HOME/formal-verification-workspace/STRIVE/model_ckpt/traffic_model.pth \
-    --capture $HOME/formal-verification-workspace/STRIVE/prior_stage_c_capture.pt \
+    --capture $HOME/formal-verification-workspace/strive-prior-verification/prior_stage_c_capture.pt \
     --epsilon 0.0008 \
     --delta 0.05
 ```
 ---
 
-## 6. Verify Stage D
-In STRIVE `src/test_traffic.py`:
-```bash
-
-    # from capture_prior_head import attach_capture
-
-    # attach_capture(model, "prior_head_capture.pt")
-
-    # from capture_prior_stage_b import attach_stage_b_capture
-
-    # attach_stage_b_capture(model, "prior_stage_b_capture.pt")
-
-    # from capture_prior_stage_c import attach_stage_c_capture
-    
-    # attach_stage_c_capture(model, "prior_stage_c_capture.pt")
-
-    from capture_prior_stage_d import attach_stage_d_capture
-
-    attach_stage_d_capture(model, "prior_stage_d_capture.pt")
-```
-
+### 4.4 Verify Stage D
 Run:
-```bash
-cd $HOME/formal-verification-workspace/STRIVE
-
-export PYTHONPATH="~/formal-verification-workspace/strive-prior-verification:$PYTHONPATH"
-
-CUDA_VISIBLE_DEVICES="" \
-~/envs/strive/bin/python \
-src/test_traffic.py \
-    --config ./configs/test_traffic.cfg \
-    --ckpt ./model_ckpt/traffic_model.pth
-```
-
-### 6.1 Run verifier: D1
-```bash
-cd $HOME/formal-verification-workspace/strive-prior-verification
-
-export PYTHONPATH="$HOME/formal-verification-workspace/alpha-beta-CROWN/auto_LiRPA:$PYTHONPATH"
-```
+### 4.4.1 Run verifier: D1
 ```bash
 python verify_prior_stage_d1_generalized_all_agents.py \
     --ckpt $HOME/formal-verification-workspace/STRIVE/model_ckpt/traffic_model.pth \
-    --c-capture $HOME/formal-verification-workspace/STRIVE/prior_stage_c_capture.pt \
-    --d1-all-capture $HOME/formal-verification-workspace/STRIVE/prior_stage_d1_all_capture.pt \
-    --old-d-capture $HOME/formal-verification-workspace/STRIVE/prior_stage_d_capture.pt \
+    --c-capture $HOME/formal-verification-workspace/strive-prior-verification/prior_stage_c_capture.pt \
+    --d1-all-capture $HOME/formal-verification-workspace/strive-prior-verification/prior_stage_d1_all_capture.pt \
+    --old-d-capture $HOME/formal-verification-workspace/strive-prior-verification/prior_stage_d_capture.pt \
     --epsilon 0.001 \
     --delta 0.05
 ```
@@ -395,7 +447,7 @@ export PYTHONPATH="$HOME/formal-verification-workspace/alpha-beta-CROWN/auto_LiR
 ```bash  
 python verify_prior_stage_d2_generalized_patch_late_crown.py \
     --ckpt $HOME/formal-verification-workspace/STRIVE/model_ckpt/traffic_model.pth \
-    --capture $HOME/formal-verification-workspace/STRIVE/prior_stage_d_capture.pt \
+    --capture $HOME/formal-verification-workspace/strive-prior-verification/prior_stage_d_capture.pt \
     --epsilon 0.001 \
     --delta 0.05 \
     --row 127 --col 127 --patch-size 3 \
