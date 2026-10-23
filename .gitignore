@@ -5,6 +5,6 @@ __pycache__/
 *.csv
 *.json
 
-# *.pt
-# *.pth
+*.pt
+*.pth
 
