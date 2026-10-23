@@ -205,7 +205,7 @@ python src/test_traffic.py \
 ---
 
 ## 3. Capture Hook
-Check environment: It should be `strive`
+1. Check environment: It should be `strive`
 ```bash
 cd $HOME/formal-verification-workspace/STRIVE
 conda activate strive
@@ -213,11 +213,13 @@ conda activate strive
 
 ### 3.1 Attach the capture hook for Stage A
 1. In STRIVE, open `src/test_traffic.py` and locate `model.eval()`
-Immediately below `model.eval()`, before `with torch.no_grad():`, temporarily add:
-
+Import
 ```bash
-    from capture_prior_head import attach_capture
-
+from capture_prior_head import attach_capture
+```
+And:
+Immediately below `model.eval()`, before `with torch.no_grad():`, temporarily add:
+```bash
     attach_capture(
         model,
         os.path.expanduser(
@@ -235,18 +237,19 @@ The run should create `prior_head_capture.pt` in the `strive-prior-verification`
 
 ### 3.2 Attach the capture hook for Stage B
 1. In STRIVE, open `src/test_traffic.py` and locate `model.eval()`
+Import
+```bash
+# from capture_prior_head import attach_capture
+from capture_prior_stage_b import attach_stage_b_capture
+```
 Immediately below `model.eval()`, before `with torch.no_grad():`, temporarily replace the old capture call with:
 ```bash
-    # from capture_prior_head import attach_capture
-
     # attach_capture(
     #     model,
     #     os.path.expanduser(
     #         "~/formal-verification-workspace/strive-prior-verification/prior_head_capture.pt"
     #     )
     # )
-
-    from capture_prior_stage_b import attach_stage_b_capture
 
     attach_stage_b_capture(
         model,
@@ -265,12 +268,15 @@ The run should create `prior_stage_b_capture.pt` in the `strive-prior-verificati
 
 ### 3.3 Attach the capture hook for Stage C
 1. In STRIVE, open `src/test_traffic.py` and locate `model.eval()`
+Import
+```bash
+# from capture_prior_head import attach_capture
+# from capture_prior_stage_b import attach_stage_b_capture
+from capture_prior_stage_c import attach_stage_c_capture
+```
 Immediately below `model.eval()`, before `with torch.no_grad():`, temporarily replace the old capture call with:
 
 ```bash
-
-    # from capture_prior_head import attach_capture
-
     # attach_capture(
     #     model,
     #     os.path.expanduser(
@@ -278,16 +284,12 @@ Immediately below `model.eval()`, before `with torch.no_grad():`, temporarily re
     #     )
     # )
 
-    # from capture_prior_stage_b import attach_stage_b_capture
-
     # attach_stage_b_capture(
     #     model,
     #     os.path.expanduser(
     #         "~/formal-verification-workspace/strive-prior-verification/stage_b_capture.pt"
     #     )
     # )
-
-    from capture_prior_stage_c import attach_stage_c_capture
 
     attach_stage_c_capture(
         model,
