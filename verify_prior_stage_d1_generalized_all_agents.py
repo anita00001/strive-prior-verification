@@ -1,295 +1,284 @@
 #!/usr/bin/env python3
 """
-STRIVE Stage D1-generalized verifier.
+STRIVE Stage D1 generalized all-agents verifier.
 
-This generalizes the previous target-only D1 certificate to ALL 16 involved
-agents jointly.
+Required artifacts:
+    traffic_model.pth
+    prior_stage_d_capture.pt
 
-Important scope
----------------
-This mirrors the original D1 abstraction: the uncertain variables are the
-24 continuous state coordinates inside each agent's 38-D *past-encoder input*,
+The capture is produced by capture_prior_stage_d.py from the first suitable
+Stage-D scene. This verifier does not depend on Stage C and does not assume a
+fixed number of agents.
 
-    4 timesteps x 6 state values = 24 values/agent.
+Property:
+    For every captured agent, the 24 continuous state coordinates inside its
+    38-D past_encoder input are perturbed jointly:
 
-For 16 involved agents:
-    16 x 24 = 384 jointly uncertain variables.
+        4 timesteps x 6 state values = 24 values/agent.
 
-The following past-encoder inputs remain fixed:
-  * visibility flags,
-  * vehicle length/width attributes,
-  * semantic tail inside the past encoder.
+    If the captured scene contains N agents, the verifier has N x 24 jointly
+    uncertain variables. For every output i=0,...,63:
 
-Also fixed in this D1-generalized stage:
-  * all map features,
-  * semantic labels used by the prior,
-  * relative-pose edge features,
-  * graph topology.
+        |y_i(x) - y_i(x0)| <= delta.
 
-Therefore this is NOT yet a certificate for perturbing world-frame raw history
-while simultaneously recomputing map crops and graph relative poses. It is the
-correct all-agent generalization of the earlier D1 past-encoder-input property.
+Held fixed:
+    visibility flags; vehicle length/width attributes; semantic tail inside
+    past_encoder; all map features; prior semantic labels; relative-pose edge
+    features; and graph topology.
 
-Property
---------
-For all 384 state coordinates within +/- epsilon simultaneously,
-
-    |y_i(x) - y_i(x0)| <= delta,  i=0,...,63.
-
-Method
-------
-auto_LiRPA ordinary backward CROWN.
-
-NOT_PROVED is not a counterexample.
+This is not a world-frame history certificate: map crops and relative poses
+are not recomputed after perturbing the past_encoder state coordinates.
 """
 
 import argparse
-import copy
 import csv
+import hashlib
 import json
 from pathlib import Path
 
 import torch
 from torch import nn
 
-import verify_prior_stage_c_all_agents as c1
-from verify_prior_stage_d1 import build_model as build_old_d1_model
-
-
-STATE_INDICES_DEFAULT = []
-for _t in range(4):
-    STATE_INDICES_DEFAULT.extend(range(_t * 9, _t * 9 + 6))
+from verify_prior_stage_d1 import (
+    FixedSceneTargetPrior,
+    load_prefixed,
+    load_state,
+    mlp,
+    output_name,
+)
 
 
 class D1AllAgentsModel(nn.Module):
+    """All-agent past_encoder + fixed map features + target prior output."""
+
     def __init__(
         self,
         past_encoder,
         prior_model,
         fixed_past_input,
         fixed_map_feat,
-        fixed_semantics,
+        fixed_sem,
         state_indices,
     ):
         super().__init__()
+
         self.past_encoder = past_encoder
         self.prior_model = prior_model
 
         self.register_buffer(
             "fixed_past_input",
-            fixed_past_input.unsqueeze(0).float(),  # [1,N,38]
+            fixed_past_input.unsqueeze(0).float(),
         )
         self.register_buffer(
             "fixed_map_feat",
-            fixed_map_feat.unsqueeze(0).float(),  # [1,N,64]
+            fixed_map_feat.unsqueeze(0).float(),
         )
         self.register_buffer(
-            "fixed_semantics",
-            fixed_semantics.unsqueeze(0).float(),  # [1,N,2]
-        )
-        self.register_buffer(
-            "state_indices",
-            torch.tensor(state_indices, dtype=torch.long),
+            "fixed_sem",
+            fixed_sem.unsqueeze(0).float(),
         )
 
         self.num_agents = int(fixed_past_input.shape[0])
-        self.num_state = int(len(state_indices))
+        self.state_indices = [int(v) for v in state_indices]
 
-        if self.num_state != 24:
-            raise RuntimeError("Expected 24 state coordinates per agent")
-
-        # Build the complementary fixed-coordinate indices once.
-        all_idx = list(range(38))
-        state_set = set(int(i) for i in state_indices)
-        fixed_idx = [i for i in all_idx if i not in state_set]
-        self.register_buffer(
-            "fixed_indices",
-            torch.tensor(fixed_idx, dtype=torch.long),
-        )
-
-        # Instead of scatter/in-place assignment, retain exact input ordering by
-        # rebuilding the known STRIVE layout per time step.
         expected = []
         for t in range(4):
             expected.extend(range(t * 9, t * 9 + 6))
-        if list(state_indices) != expected:
+        if self.state_indices != expected:
             raise RuntimeError(
-                "This verifier expects STRIVE layout "
-                "4 x [state6,vis1,lw2] + sem2"
+                "Expected STRIVE past input layout 4 x [state6,vis1,lw2] + sem2."
             )
 
     def reconstruct_past_input(self, state_root):
-        # state_root: [B,N,24] = four contiguous 6-D state blocks.
         B = state_root.shape[0]
         states = state_root.reshape(B, self.num_agents, 4, 6)
-
         base = self.fixed_past_input.expand(B, -1, -1)
 
         steps = []
         for t in range(4):
-            off = t * 9
-            fixed_tail = base[:, :, off + 6 : off + 9]  # vis + lw2
-            steps.append(torch.cat([states[:, :, t, :], fixed_tail], dim=-1))
+            off = 9 * t
+            fixed_tail = base[:, :, off + 6 : off + 9]
+            steps.append(
+                torch.cat([states[:, :, t, :], fixed_tail], dim=-1)
+            )
 
         first36 = torch.cat(steps, dim=-1)
         sem_tail = base[:, :, 36:38]
         return torch.cat([first36, sem_tail], dim=-1)
 
     def forward(self, state_root):
-        past_in = self.reconstruct_past_input(state_root)
-        past_feat = self.past_encoder(past_in)
+        past_input = self.reconstruct_past_input(state_root)
+        past_feat = self.past_encoder(past_input)
 
         B = state_root.shape[0]
         map_feat = self.fixed_map_feat.expand(B, -1, -1)
-        sem = self.fixed_semantics.expand(B, -1, -1)
+        sem = self.fixed_sem.expand(B, -1, -1)
 
-        prior_in = torch.cat([past_feat, map_feat, sem], dim=-1)
-        return self.prior_model(prior_in)
-
-
-def output_name(i):
-    return "mu_%d" % i if i < 32 else "logvar_%d" % (i - 32)
+        prior_input = torch.cat([past_feat, map_feat, sem], dim=-1)
+        return self.prior_model(prior_input)
 
 
-def extract_state_root(past_input, state_indices):
-    return past_input[:, state_indices].unsqueeze(0)
+def build_components(ckpt, cap):
+    state = load_state(ckpt)
+
+    past_encoder = mlp([38, 128, 128, 128, 64])
+    load_prefixed(past_encoder, state, "past_encoder.net.")
+
+    prior_model = FixedSceneTargetPrior(
+        cap["sem"].float(),
+        cap["edge_index"].long(),
+        cap["rel_trans"].float(),
+        int(cap["target_agent"]),
+    )
+
+    load_prefixed(prior_model.mlp_in, state, "prior_net.mlp_in.net.")
+    load_prefixed(prior_model.edge_mlp, state, "prior_net.msg.0.edge_mlp.net.")
+    load_prefixed(
+        prior_model.update_mlp,
+        state,
+        "prior_net.msg.0.update_mlp.net.",
+    )
+    load_prefixed(prior_model.mlp_out, state, "prior_net.mlp_out.net.")
+
+    return past_encoder.eval(), prior_model.eval()
 
 
 def main(args):
+    if args.epsilon <= 0 or args.delta <= 0:
+        raise ValueError("epsilon and delta must be positive")
+
     torch.set_num_threads(args.threads)
 
-    ccap = torch.load(args.c_capture, map_location="cpu", weights_only=True)
-    dcap = torch.load(args.d1_all_capture, map_location="cpu", weights_only=True)
-    old_dcap = torch.load(args.old_d_capture, map_location="cpu", weights_only=True)
+    cap = torch.load(args.capture, map_location="cpu", weights_only=True)
 
-    (
-        prior_model,
-        involved_x0,
-        recorded,
-        target,
-        source_nodes_per_edge,
-        unique_source_nodes,
-        involved_nodes,
-        incoming_ids,
-    ) = c1.build_model_and_input(args.ckpt, ccap)
+    required = {
+        "all_past_input",
+        "all_past_feat",
+        "all_map_feat",
+        "node_input",
+        "sem",
+        "edge_index",
+        "rel_trans",
+        "original_output",
+        "target_agent",
+    }
+    missing = required.difference(cap)
+    if missing:
+        raise RuntimeError("Stage-D capture missing keys: %s" % sorted(missing))
 
-    prior_model = prior_model.eval()
+    past_all = cap["all_past_input"].float()
+    captured_past_feat = cap["all_past_feat"].float()
+    fixed_map = cap["all_map_feat"].float()
+    sem = cap["sem"].float()
+    captured_node = cap["node_input"].float()
+    target = int(cap["target_agent"])
 
-    # Reuse the already-debugged old D1 model builder only to recover the
-    # checkpoint's trained past_encoder module.
-    old_full_model, _, _ = build_old_d1_model(args.ckpt, old_dcap)
-    past_encoder = copy.deepcopy(old_full_model.past_encoder).float().eval()
-
-    if "all_past_input" not in dcap or "all_past_feat" not in dcap:
+    if past_all.dim() != 2 or past_all.shape[1] != 38:
         raise RuntimeError(
-            "D1-all capture must contain all_past_input and all_past_feat"
+            "Expected all_past_input [N,38], got %s" % (tuple(past_all.shape),)
         )
 
-    past_all = dcap["all_past_input"].float()
-    past_feat_all = dcap["all_past_feat"].float()
+    N = int(past_all.shape[0])
+
+    if captured_past_feat.shape != (N, 64):
+        raise RuntimeError("Expected all_past_feat [%d,64]." % N)
+    if fixed_map.shape != (N, 64):
+        raise RuntimeError("Expected all_map_feat [%d,64]." % N)
+    if sem.shape != (N, 2):
+        raise RuntimeError("Expected sem [%d,2]." % N)
+    if captured_node.shape != (N, 130):
+        raise RuntimeError("Expected node_input [%d,130]." % N)
+    if not (0 <= target < N):
+        raise RuntimeError("target_agent outside captured node range.")
 
     state_indices = (
-        dcap["state_indices_in_past_input"].long().tolist()
-        if "state_indices_in_past_input" in dcap
-        else list(STATE_INDICES_DEFAULT)
+        cap["state_indices_in_past_input"].long().tolist()
+        if "state_indices_in_past_input" in cap
+        else [i for t in range(4) for i in range(t * 9, t * 9 + 6)]
     )
 
-    # C1 involved-node order is [target, unique direct sources...].
-    idx = torch.tensor(involved_nodes, dtype=torch.long)
-    past_involved = past_all[idx]
-    captured_past_feat = past_feat_all[idx]
-
-    N = len(involved_nodes)
-    if N != 16:
-        raise RuntimeError(
-            "Expected 16 involved agents for D1-generalized, got %d" % N
-        )
-
-    if past_involved.shape != (N, 38):
-        raise RuntimeError(
-            "Expected involved past input shape (%d,38), got %s"
-            % (N, tuple(past_involved.shape))
-        )
-
-    # Fixed values must come from the exact C-stage scene.
-    fixed_map = involved_x0[0, :, 64:128].clone().float()
-    fixed_sem = involved_x0[0, :, 128:130].clone().float()
-    c_past_feat = involved_x0[0, :, 0:64].clone().float()
+    past_encoder, prior_model = build_components(args.ckpt, cap)
 
     model = D1AllAgentsModel(
         past_encoder,
         prior_model,
-        past_involved,
+        past_all,
         fixed_map,
-        fixed_sem,
+        sem,
         state_indices,
     ).eval()
 
-    state0 = extract_state_root(past_involved, state_indices).float()
+    state0 = past_all[:, state_indices].unsqueeze(0).float()
 
-    # ------------------------------------------------------------
-    # Nominal equivalence checks before making any formal claim.
-    # ------------------------------------------------------------
-    with torch.no_grad():
-        reconstructed_past = past_encoder(past_involved)
-        nominal = model(state0)
-
-    past_capture_err = float(
-        (reconstructed_past - captured_past_feat).abs().max()
-    )
-    past_c_err = float(
-        (reconstructed_past - c_past_feat).abs().max()
-    )
-    full_err = float(
-        (nominal - recorded.float()).abs().max()
-    )
-
-    print("=" * 78)
-    print("STRIVE STAGE D1-GENERALIZED: ALL-AGENT PAST STATES")
-    print("=" * 78)
-    print("target agent                    : %d" % target)
-    print("incoming edges                  : %d" % int(incoming_ids.numel()))
-    print("involved agents                 : %d" % N)
-    print("state dims per agent            : 24")
-    print("total uncertain dimensions      : %d" % (N * 24))
-    print("epsilon                         : %.8g" % args.epsilon)
-    print("delta                           : %.8g" % args.delta)
-    print("past-encoder/capture error      : %.8g" % past_capture_err)
-    print("past-feature/C-stage error      : %.8g" % past_c_err)
-    print("full target-output error        : %.8g" % full_err)
-    print("fixed                           : visibility, lw, semantics, map, relpose, topology")
-
-    max_equiv = max(past_capture_err, past_c_err, full_err)
-    if max_equiv > args.equiv_tol:
+    recorded = cap["original_output"].float()
+    if recorded.dim() == 3 and recorded.shape[0] == 1:
+        recorded = recorded[0]
+    if recorded.dim() != 2 or recorded.shape != (N, 64):
         raise RuntimeError(
-            "Nominal equivalence failed (max %.8g > %.8g). "
-            "No verification claim." % (max_equiv, args.equiv_tol)
+            "Expected original_output [N,64], got %s" % (tuple(recorded.shape),)
         )
 
-    # ------------------------------------------------------------
-    # Formal root box: all 384 state coordinates perturbed jointly.
-    # ------------------------------------------------------------
+    recorded_target = recorded[target].reshape(1, 64)
+
+    with torch.no_grad():
+        reconstructed_past = past_encoder(past_all)
+        reconstructed_node = torch.cat(
+            [reconstructed_past, fixed_map, sem],
+            dim=-1,
+        )
+        nominal = model(state0)
+
+    past_err = float(
+        (reconstructed_past - captured_past_feat).abs().max()
+    )
+    node_err = float(
+        (reconstructed_node - captured_node).abs().max()
+    )
+    full_err = float(
+        (nominal - recorded_target).abs().max()
+    )
+
+    uncertain_dims = N * 24
+
+    print("=" * 78)
+    print("STRIVE STAGE D1-GENERALIZED: ALL CAPTURED AGENTS")
+    print("=" * 78)
+    print("captured agents                 : %d" % N)
+    print("target agent                    : %d" % target)
+    print("incoming edges                  : %d" % prior_model.incoming_count)
+    print("state dims per agent            : 24")
+    print("total uncertain dimensions      : %d" % uncertain_dims)
+    print("epsilon                         : %.8g" % args.epsilon)
+    print("delta                           : %.8g" % args.delta)
+    print("past-encoder equivalence error  : %.8g" % past_err)
+    print("node-input equivalence error    : %.8g" % node_err)
+    print("full target-output error        : %.8g" % full_err)
+    print(
+        "fixed                           : visibility, lw, semantics, "
+        "map features, relpose, topology"
+    )
+
+    max_equiv = max(past_err, node_err, full_err)
+    if max_equiv > args.equiv_tol:
+        raise RuntimeError(
+            "Nominal equivalence failed (max %.8g > %.8g). No verification claim."
+            % (max_equiv, args.equiv_tol)
+        )
+
     x_L = state0 - float(args.epsilon)
     x_U = state0 + float(args.epsilon)
 
     from auto_LiRPA import BoundedModule, BoundedTensor
     from auto_LiRPA.perturbations import PerturbationLpNorm
 
-    ptb = PerturbationLpNorm(
-        norm=float("inf"),
-        x_L=x_L,
-        x_U=x_U,
-    )
+    ptb = PerturbationLpNorm(norm=float("inf"), x_L=x_L, x_U=x_U)
     bx = BoundedTensor(state0, ptb)
 
     print("Building bounded D1-generalized model...")
     bounded = BoundedModule(model, state0, device="cpu")
     print("Computing %s bounds..." % args.method)
 
-    lb, ub = bounded.compute_bounds(
-        x=(bx,),
-        method=args.method,
-    )
+    lb, ub = bounded.compute_bounds(x=(bx,), method=args.method)
     lb = lb.detach()
     ub = ub.detach()
 
@@ -303,7 +292,7 @@ def main(args):
         lo = float(lb[0, i])
         hi = float(ub[0, i])
         dev = max(n - lo, hi - n)
-        ok = (lo >= n - args.delta) and (hi <= n + args.delta)
+        ok = lo >= n - args.delta and hi <= n + args.delta
         verdict = "CERTIFIED" if ok else "NOT_PROVED"
         certified += int(ok)
 
@@ -311,18 +300,17 @@ def main(args):
             worst_dev = dev
             worst_idx = i
 
-        rows.append(
-            {
-                "output": output_name(i),
-                "index": i,
-                "nominal": n,
-                "lower": lo,
-                "upper": hi,
-                "max_deviation": dev,
-                "delta": args.delta,
-                "verdict": verdict,
-            }
-        )
+        row = {
+            "output": output_name(i),
+            "index": i,
+            "nominal": n,
+            "lower": lo,
+            "upper": hi,
+            "max_deviation": dev,
+            "delta": args.delta,
+            "verdict": verdict,
+        }
+        rows.append(row)
 
         print(
             "%-10s nominal=%+.6f interval=[%+.6f, %+.6f] "
@@ -332,60 +320,38 @@ def main(args):
 
     status = "CERTIFIED" if certified == 64 else "NOT_PROVED"
 
-    print()
-    print("=" * 78)
-    print("STAGE D1-GENERALIZED SUMMARY")
-    print("=" * 78)
-    print("Status                         : %s" % status)
-    print("Target agent                   : %d" % target)
-    print("Involved agents                : %d" % N)
-    print("Incoming edges                 : %d" % int(incoming_ids.numel()))
-    print("Uncertain state dims           : %d" % (N * 24))
-    print("Past steps x state             : 4 x 6 per agent")
-    print("Epsilon                        : %.8g" % args.epsilon)
-    print("Delta                          : %.8g" % args.delta)
-    print("Certified outputs              : %d/64" % certified)
-    print("Not proved                     : %d/64" % (64 - certified))
-    print("Worst output                   : %s" % output_name(worst_idx))
-    print("Worst max deviation            : %.6f" % worst_dev)
-    print(
-        "Overall verdict                 : %s"
-        % ("ALL CERTIFIED" if certified == 64 else "PARTIAL / NOT PROVED")
-    )
-    print("=" * 78)
-
     result = {
         "stage": "D1-generalized-all-agents",
         "status": status,
-        "scope": {
-            "target_agent": target,
-            "involved_agents": N,
-            "incoming_edges": int(incoming_ids.numel()),
-            "uncertain_dimensions": N * 24,
-            "per_agent": "4 timesteps x 6 state coordinates in 38-D past-encoder input",
-            "epsilon": args.epsilon,
-            "delta": args.delta,
-            "fixed": [
-                "past visibility flags",
-                "vehicle length/width attributes",
-                "past-encoder semantic tail",
-                "map features",
-                "prior semantic labels",
-                "relative-pose edge features",
-                "graph topology",
-            ],
-            "important_limitation": (
-                "This perturbs the state coordinates entering the past encoder, "
-                "matching the original D1 abstraction. It does not recompute map "
-                "crops or relative poses from perturbed world-frame history."
-            ),
-        },
-        "equivalence": {
-            "past_encoder_vs_d1_all_capture": past_capture_err,
-            "past_feature_vs_c_capture": past_c_err,
-            "full_output_vs_c_capture": full_err,
-        },
+        "scene_selection": cap.get("selection_rule", "first suitable Stage-D scene"),
+        "captured_agents": N,
+        "target_agent": target,
+        "incoming_edges": int(prior_model.incoming_count),
+        "uncertain_dimensions": uncertain_dims,
+        "per_agent_uncertain_dimensions": 24,
+        "epsilon": args.epsilon,
+        "delta": args.delta,
         "method": args.method,
+        "fixed": [
+            "past visibility flags",
+            "vehicle length/width attributes",
+            "past-encoder semantic tail",
+            "all map features",
+            "prior semantic labels",
+            "relative-pose edge features",
+            "graph topology",
+        ],
+        "important_limitation": (
+            "The uncertain variables are the state coordinates entering "
+            "past_encoder. Map crops and relative poses are not recomputed "
+            "from perturbed world-frame histories."
+        ),
+        "equivalence": {
+            "past_encoder_max_abs_error": past_err,
+            "node_input_max_abs_error": node_err,
+            "full_target_output_max_abs_error": full_err,
+        },
+        "checkpoint_sha256": hashlib.sha256(Path(args.ckpt).read_bytes()).hexdigest(),
         "num_certified": certified,
         "num_not_proved": 64 - certified,
         "worst_output": output_name(worst_idx),
@@ -400,6 +366,20 @@ def main(args):
         writer.writeheader()
         writer.writerows(rows)
 
+    print()
+    print("=" * 78)
+    print("STAGE D1-GENERALIZED SUMMARY")
+    print("=" * 78)
+    print("Status                         : %s" % status)
+    print("Captured agents                : %d" % N)
+    print("Target agent                   : %d" % target)
+    print("Incoming edges                 : %d" % prior_model.incoming_count)
+    print("Uncertain state dims           : %d" % uncertain_dims)
+    print("Certified outputs              : %d/64" % certified)
+    print("Not proved                     : %d/64" % (64 - certified))
+    print("Worst output                   : %s" % output_name(worst_idx))
+    print("Worst max deviation            : %.6f" % worst_dev)
+    print("=" * 78)
     print("Wrote", args.out)
     print("Wrote", args.csv)
 
@@ -409,13 +389,7 @@ def main(args):
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt", required=True)
-    p.add_argument("--c-capture", required=True)
-    p.add_argument("--d1-all-capture", required=True)
-    p.add_argument(
-        "--old-d-capture",
-        required=True,
-        help="Existing prior_stage_d_capture.pt; used only to recover past_encoder via old D1 build_model.",
-    )
+    p.add_argument("--capture", required=True)
     p.add_argument("--epsilon", type=float, default=0.001)
     p.add_argument("--delta", type=float, default=0.05)
     p.add_argument(

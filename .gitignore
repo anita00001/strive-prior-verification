@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+
+*.csv
+*.json
+
+*.pt
+*.pth
+

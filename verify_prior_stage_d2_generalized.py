@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-STRIVE Stage D2-generalized patch custom-normalization backward-CROWN verifier.
+STRIVE Stage D2 generalized map-patch custom-normalization backward-CROWN verifier.
 
 This verifier is model-specific.  It keeps ordinary CROWN-style affine bounds
 through every ReLU/Linear/Conv layer, but treats GroupNorm(1,C) and LayerNorm
@@ -12,8 +12,8 @@ That is the key difference from the earlier failed formulations.
 Scope
 -----
 Current captured scene:
-  * one selected target agent;
-  * one incoming message edge;
+  * one selected target agent from the unified Stage-D capture;
+  * one or more incoming message edges are supported;
   * all four channels in one square map patch are uncertain jointly;
   * everything else fixed.
 
@@ -55,20 +55,19 @@ For GroupNorm in the map CNN, tight value/derivative bounds from the existing
 K-root map sensitivity propagation are reused to obtain positive variance
 invariants.  Those were already observed to remain healthy through GN6.
 
-Architecture used for the selected one-edge scene
+Architecture used for the selected captured scene
 -------------------------------------------------
 map patch (K = 4 x patch_size x patch_size scalars)
  -> six Conv/GN/ReLU blocks
  -> 64-D map feature
  -> prior_mlp_in
- -> edge_mlp (single incoming edge; max is identity)
+ -> edge_mlp for every incoming source
+ -> exact graph-level coordinate max via pairwise ReLU identities
  -> update_mlp
  -> prior_mlp_out
  -> 64 outputs
 
-The prior is represented as a sequential CROWN graph by retaining h while the
-edge MLP is evaluated, i.e. a state [h, message].  This preserves the branch
-correlation exactly at the affine-graph level.
+The prior is represented as a sequential CROWN graph that retains the target\nhidden state while all incoming message branches are evaluated. Coordinate-\nwise max aggregation is represented with max(a,b)=ReLU(a-b)+b before the\nusual sound CROWN relaxation is applied.
 
 Verdicts
 --------
@@ -98,25 +97,829 @@ import json
 import math
 import time
 import traceback
-from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 from torch import nn
 import torch.nn.functional as F
 
-from verify_prior_stage_d1 import build_model
-from verify_prior_stage_d2_compositional_lipschitz import (
-    conv_value_interval,
-    conv_deriv_interval,
-    groupnorm1_sensitivity,
-    relu_propagate,
-    linear_value_interval as map_linear_value_interval,
-    linear_deriv_interval as map_linear_deriv_interval,
-    mvt_value_box,
-    max_abs_interval,
-    outward,
-)
+
+
+
+# ============================================================================
+# Self-contained STRIVE model reconstruction
+# ============================================================================
+
+def mlp(sizes):
+    layers = [nn.Linear(sizes[0], sizes[1])]
+    for i in range(1, len(sizes) - 1):
+        layers.extend(
+            [
+                nn.LayerNorm(sizes[i]),
+                nn.ReLU(),
+                nn.Linear(sizes[i], sizes[i + 1]),
+            ]
+        )
+    return nn.Sequential(*layers)
+
+
+def load_prefixed(module, state, prefix):
+    sub = {
+        k[len(prefix):]: v
+        for k, v in state.items()
+        if k.startswith(prefix)
+    }
+    if not sub:
+        raise ValueError(f"No checkpoint keys found with prefix {prefix}")
+    module.load_state_dict(sub, strict=True)
+
+
+class GroupNorm1Exact(nn.Module):
+    """Exact GroupNorm(num_groups=1) rewrite using LayerNorm over C,H,W.
+
+    PyTorch GroupNorm(1,C) computes mean/variance across all C*H*W values for
+    each sample, then applies one affine weight/bias per channel. LayerNorm over
+    [C,H,W] with elementwise_affine=False computes the same normalization.
+    """
+
+    def __init__(self, channels, height, width, eps=1e-5):
+        super().__init__()
+        self.norm = nn.LayerNorm(
+            [channels, height, width],
+            eps=eps,
+            elementwise_affine=False,
+        )
+        self.weight = nn.Parameter(torch.ones(channels))
+        self.bias = nn.Parameter(torch.zeros(channels))
+
+    def forward(self, x):
+        y = self.norm(x)
+        return (
+            y * self.weight.view(1, -1, 1, 1)
+            + self.bias.view(1, -1, 1, 1)
+        )
+
+
+class MapEncoderExact(nn.Module):
+    KERNELS = [7, 5, 5, 3, 3, 3]
+    STRIDES = [2, 2, 2, 2, 2, 2]
+    CHANNELS = [4, 16, 32, 64, 64, 128, 128]
+
+    def __init__(self, map_h, map_w):
+        super().__init__()
+        if map_h != map_w:
+            raise ValueError("Expected square STRIVE map crop.")
+
+        blocks = []
+        spatial = map_h
+        self.conv_indices = []
+        self.gn_indices = []
+
+        for i, (kernel, stride) in enumerate(
+            zip(self.KERNELS, self.STRIDES)
+        ):
+            conv = nn.Conv2d(
+                self.CHANNELS[i],
+                self.CHANNELS[i + 1],
+                kernel_size=kernel,
+                stride=stride,
+                padding=0,
+            )
+            spatial = (spatial - kernel) // stride + 1
+            gn = GroupNorm1Exact(
+                self.CHANNELS[i + 1],
+                spatial,
+                spatial,
+                eps=1e-5,
+            )
+            blocks.extend([conv, gn, nn.ReLU()])
+            self.conv_indices.append(3 * i)
+            self.gn_indices.append(3 * i + 1)
+
+        self.net = nn.Sequential(*blocks)
+        self.final_spatial = spatial
+        self.feature = nn.Linear(
+            self.CHANNELS[-1] * spatial * spatial,
+            64,
+        )
+
+    def forward(self, x):
+        y = self.net(x)
+        y = y.reshape(y.shape[0], -1)
+        return self.feature(y)
+
+
+class FullTargetPriorD1(nn.Module):
+    def __init__(
+        self,
+        map_h,
+        map_w,
+        sem_target,
+        sem_sources,
+        rel_trans,
+        source_hidden,
+    ):
+        super().__init__()
+
+        # For the user's STRIVE setup:
+        # 4 past steps * (6 state + 1 visibility + 2 vehicle attrs) + 2 sem.
+        self.past_encoder = mlp([38, 128, 128, 128, 64])
+        self.map_encoder = MapEncoderExact(map_h, map_w)
+
+        self.prior_mlp_in = mlp([130, 128, 128, 128])
+        self.edge_mlp = mlp([264, 128, 128, 128])
+        self.update_mlp = mlp([258, 128, 128])
+        self.prior_mlp_out = mlp([128, 128, 128, 64])
+
+        self.register_buffer(
+            "sem_target", sem_target.reshape(1, 2).float()
+        )
+        self.register_buffer(
+            "sem_sources", sem_sources.unsqueeze(0).float()
+        )
+        self.register_buffer(
+            "rel_trans", rel_trans.unsqueeze(0).float()
+        )
+        self.register_buffer(
+            "source_hidden", source_hidden.unsqueeze(0).float()
+        )
+
+    @staticmethod
+    def coordinate_max(messages):
+        # Exact coordinate-wise max, expressed with affine + ReLU:
+        # max(a,b) = ReLU(a-b) + b
+        cur = messages[:, 0, :]
+        for j in range(1, messages.shape[1]):
+            nxt = messages[:, j, :]
+            cur = torch.relu(cur - nxt) + nxt
+        return cur
+
+    def encode_branches(self, past_in, map_obs):
+        past_feat = self.past_encoder(past_in)
+        map_feat = self.map_encoder(map_obs)
+        return past_feat, map_feat
+
+    def forward(self, past_in, map_obs):
+        past_feat, map_feat = self.encode_branches(past_in, map_obs)
+
+        prior_input = torch.cat(
+            [past_feat, map_feat, self.sem_target],
+            dim=-1,
+        )
+        h_t = self.prior_mlp_in(prior_input)
+
+        k = self.source_hidden.shape[1]
+        h_i = h_t.unsqueeze(1).expand(-1, k, -1)
+        sem_i = self.sem_target.unsqueeze(1).expand(-1, k, -1)
+
+        msg_in = torch.cat(
+            [
+                h_i,
+                self.source_hidden,
+                sem_i,
+                self.sem_sources,
+                self.rel_trans,
+            ],
+            dim=-1,
+        )
+        messages = self.edge_mlp(msg_in)
+        aggr = self.coordinate_max(messages)
+
+        update_in = torch.cat(
+            [h_t, aggr, self.sem_target],
+            dim=-1,
+        )
+        updated = self.update_mlp(update_in)
+        return self.prior_mlp_out(updated)
+
+
+def load_state(ckpt):
+    raw = torch.load(ckpt, map_location="cpu", weights_only=True)
+    return raw.get("model", raw.get("state_dict", raw))
+
+
+def load_map_weights(map_encoder, state):
+    # Original map_conv is:
+    # conv, GN, ReLU, conv, GN, ReLU, ...
+    for i in range(6):
+        old_conv_idx = 3 * i
+        old_gn_idx = 3 * i + 1
+
+        conv = map_encoder.net[3 * i]
+        gn = map_encoder.net[3 * i + 1]
+
+        conv.load_state_dict(
+            {
+                "weight": state[f"map_conv.{old_conv_idx}.weight"],
+                "bias": state[f"map_conv.{old_conv_idx}.bias"],
+            }
+        )
+        with torch.no_grad():
+            gn.weight.copy_(state[f"map_conv.{old_gn_idx}.weight"])
+            gn.bias.copy_(state[f"map_conv.{old_gn_idx}.bias"])
+
+    map_encoder.feature.load_state_dict(
+        {
+            "weight": state["map_feature.weight"],
+            "bias": state["map_feature.bias"],
+        }
+    )
+
+
+def build_model(ckpt, cap):
+    state = load_state(ckpt)
+
+    node_input = cap["node_input"].float()
+    sem = cap["sem"].float()
+    edges = cap["edge_index"].long()
+    rel_trans_all = cap["rel_trans"].float()
+    target = int(cap["target_agent"])
+
+    src = edges[0]
+    dst = edges[1]
+    incoming = torch.nonzero(dst == target, as_tuple=False).flatten()
+
+    if incoming.numel() == 0:
+        raise RuntimeError("Captured target has no incoming GNN edges.")
+
+    source_nodes = src[incoming]
+    if bool((source_nodes == target).any()):
+        raise RuntimeError(
+            "Target has a self-loop; this target-only verifier assumes "
+            "all incoming source agents are fixed non-target agents."
+        )
+
+    # Precompute fixed source hidden vectors exactly from captured prior inputs.
+    prior_mlp_in_tmp = mlp([130, 128, 128, 128])
+    load_prefixed(
+        prior_mlp_in_tmp,
+        state,
+        "prior_net.mlp_in.net.",
+    )
+    prior_mlp_in_tmp.eval()
+    with torch.no_grad():
+        source_hidden = prior_mlp_in_tmp(node_input[source_nodes])
+
+    map_obs = cap["target_map_obs"]
+    if map_obs.ndim != 3:
+        raise RuntimeError(
+            f"Expected target map [C,H,W], got {tuple(map_obs.shape)}"
+        )
+    c, h, w = map_obs.shape
+    if c != 4:
+        raise RuntimeError(f"Expected 4 map channels, got {c}")
+
+    model = FullTargetPriorD1(
+        h,
+        w,
+        sem[target],
+        sem[source_nodes],
+        rel_trans_all[incoming],
+        source_hidden,
+    )
+
+    load_prefixed(
+        model.past_encoder,
+        state,
+        "past_encoder.net.",
+    )
+    load_map_weights(model.map_encoder, state)
+    load_prefixed(
+        model.prior_mlp_in,
+        state,
+        "prior_net.mlp_in.net.",
+    )
+    load_prefixed(
+        model.edge_mlp,
+        state,
+        "prior_net.msg.0.edge_mlp.net.",
+    )
+    load_prefixed(
+        model.update_mlp,
+        state,
+        "prior_net.msg.0.update_mlp.net.",
+    )
+    load_prefixed(
+        model.prior_mlp_out,
+        state,
+        "prior_net.mlp_out.net.",
+    )
+
+    return model.eval(), incoming, source_nodes
+
+
+
+# ============================================================================
+# Self-contained interval/sensitivity helpers
+# ============================================================================
+
+def min_variance_lower_bound(lower, upper, iterations=80):
+    """Sound lower bound on min variance over an elementwise box.
+
+    lower, upper: [B,C,H,W]
+    Returns [B,1,1,1].
+
+    For one flattened sample:
+        f(m) = sum_i dist(m,[l_i,u_i])^2
+        min_x Var(x) = min_m f(m)/n.
+
+    f is convex. After bisection, a tangent of f is a global lower bound.
+    We minimize that tangent over the known domain
+        m* in [min_i l_i, max_i u_i].
+    """
+    batch = lower.shape[0]
+    outs = []
+
+    # Use float64 internally to make the scalar convex solve stable.
+    for b in range(batch):
+        l = lower[b].reshape(-1).double()
+        u = upper[b].reshape(-1).double()
+        n = l.numel()
+
+        domain_a = l.min()
+        domain_b = u.max()
+
+        lo = domain_a.clone()
+        hi = domain_b.clone()
+
+        def objective_and_grad(m):
+            below = m < l
+            above = m > u
+
+            dl = torch.where(below, m - l, torch.zeros_like(l))
+            du = torch.where(above, m - u, torch.zeros_like(u))
+            d = dl + du
+
+            f = (d * d).sum()
+            g = 2.0 * d.sum()
+            return f, g
+
+        # g(m) is monotone nondecreasing.
+        for _ in range(iterations):
+            mid = (lo + hi) * 0.5
+            _, g = objective_and_grad(mid)
+            if float(g) < 0.0:
+                lo = mid
+            else:
+                hi = mid
+
+        m = (lo + hi) * 0.5
+        f, g = objective_and_grad(m)
+
+        # Convex tangent:
+        # f(t) >= f(m) + g(m)(t-m), for every t.
+        # The true optimizer lies in [domain_a, domain_b].
+        if float(g) >= 0.0:
+            tangent_min = f + g * (domain_a - m)
+        else:
+            tangent_min = f + g * (domain_b - m)
+
+        tangent_min = torch.clamp(tangent_min, min=0.0)
+        var_lb = tangent_min / float(n)
+        outs.append(var_lb.float())
+
+    return torch.stack(outs).reshape(batch, 1, 1, 1)
+
+
+
+def outward(lower, upper, abs_slack=1e-12, rel_slack=1e-10):
+    """Small conservative numerical expansion."""
+    scale = torch.maximum(lower.abs(), upper.abs())
+    pad = abs_slack + rel_slack * scale
+    return lower - pad, upper + pad
+
+
+def interval_intersection(
+    l1, u1, l2, u2, abs_slack=1e-12, rel_slack=1e-10
+):
+    lower = torch.maximum(l1, l2)
+    upper = torch.minimum(u1, u2)
+
+    tol = abs_slack + rel_slack * torch.maximum(lower.abs(), upper.abs())
+    if bool((lower > upper + tol).any()):
+        gap = float((lower - upper).max())
+        raise RuntimeError(
+            "Internal interval intersection became empty; "
+            f"max gap={gap:.8g}."
+        )
+
+    # Tiny numerical inconsistencies are closed conservatively.
+    mid = 0.5 * (lower + upper)
+    lower = torch.where(lower <= upper, lower, mid)
+    upper = torch.where(lower <= upper, upper, mid)
+    return outward(lower, upper, abs_slack, rel_slack)
+
+
+def mul_interval(a_l, a_u, b_l, b_u):
+    p1 = a_l * b_l
+    p2 = a_l * b_u
+    p3 = a_u * b_l
+    p4 = a_u * b_u
+    lower = torch.minimum(torch.minimum(p1, p2), torch.minimum(p3, p4))
+    upper = torch.maximum(torch.maximum(p1, p2), torch.maximum(p3, p4))
+    return lower, upper
+
+
+def scale_interval(lower, upper, scale):
+    p1 = lower * scale
+    p2 = upper * scale
+    return torch.minimum(p1, p2), torch.maximum(p1, p2)
+
+
+def add_interval(a_l, a_u, b_l, b_u):
+    return a_l + b_l, a_u + b_u
+
+
+def max_abs_interval(lower, upper):
+    return torch.maximum(lower.abs(), upper.abs())
+
+
+def mvt_value_box(
+    nominal,
+    direct_l,
+    direct_u,
+    deriv_l,
+    deriv_u,
+    halfwidths,
+    abs_slack,
+    rel_slack,
+):
+    """Intersect direct values with a derivative/MVT box.
+
+    deriv_* shape: [K,B,...]
+    halfwidths shape: [K]
+    """
+    k = deriv_l.shape[0]
+    view = [k] + [1] * (deriv_l.ndim - 1)
+    h = halfwidths.reshape(view)
+
+    radius = (h * max_abs_interval(deriv_l, deriv_u)).sum(dim=0)
+    mvt_l = nominal - radius
+    mvt_u = nominal + radius
+
+    lower, upper = interval_intersection(
+        direct_l,
+        direct_u,
+        mvt_l,
+        mvt_u,
+        abs_slack,
+        rel_slack,
+    )
+
+    # Center point must be enclosed.
+    tol = abs_slack + rel_slack * nominal.abs()
+    if bool(((nominal < lower - tol) | (nominal > upper + tol)).any()):
+        raise RuntimeError(
+            "Nominal activation escaped the tightened certified interval."
+        )
+
+    return lower, upper, radius
+
+
+# ---------------------------------------------------------------------------
+# Affine layers: value intervals and derivative intervals
+# ---------------------------------------------------------------------------
+
+def conv_value_interval(layer, lower, upper):
+    center = 0.5 * (lower + upper)
+    radius = 0.5 * (upper - lower)
+
+    out_center = F.conv2d(
+        center,
+        layer.weight,
+        layer.bias,
+        stride=layer.stride,
+        padding=layer.padding,
+        dilation=layer.dilation,
+        groups=layer.groups,
+    )
+    out_radius = F.conv2d(
+        radius,
+        layer.weight.abs(),
+        None,
+        stride=layer.stride,
+        padding=layer.padding,
+        dilation=layer.dilation,
+        groups=layer.groups,
+    )
+    return out_center - out_radius, out_center + out_radius
+
+
+def conv_deriv_interval(layer, lower, upper):
+    """Derivative tensors are [K,B,C,H,W]."""
+    k, b, c, h, w = lower.shape
+    lc = 0.5 * (lower + upper)
+    lr = 0.5 * (upper - lower)
+
+    lc = lc.reshape(k * b, c, h, w)
+    lr = lr.reshape(k * b, c, h, w)
+
+    out_c = F.conv2d(
+        lc,
+        layer.weight,
+        None,
+        stride=layer.stride,
+        padding=layer.padding,
+        dilation=layer.dilation,
+        groups=layer.groups,
+    )
+    out_r = F.conv2d(
+        lr,
+        layer.weight.abs(),
+        None,
+        stride=layer.stride,
+        padding=layer.padding,
+        dilation=layer.dilation,
+        groups=layer.groups,
+    )
+
+    shape = (k, b) + tuple(out_c.shape[1:])
+    out_c = out_c.reshape(shape)
+    out_r = out_r.reshape(shape)
+    return out_c - out_r, out_c + out_r
+
+
+def linear_value_interval(layer, lower, upper):
+    center = 0.5 * (lower + upper)
+    radius = 0.5 * (upper - lower)
+    out_center = F.linear(center, layer.weight, layer.bias)
+    out_radius = F.linear(radius, layer.weight.abs(), None)
+    return out_center - out_radius, out_center + out_radius
+
+
+def linear_deriv_interval(layer, lower, upper):
+    """Derivative tensors are [K,B,D]."""
+    k, b, d = lower.shape
+    center = 0.5 * (lower + upper)
+    radius = 0.5 * (upper - lower)
+
+    center = center.reshape(k * b, d)
+    radius = radius.reshape(k * b, d)
+
+    out_c = F.linear(center, layer.weight, None)
+    out_r = F.linear(radius, layer.weight.abs(), None)
+
+    shape = (k, b, out_c.shape[-1])
+    return (
+        (out_c - out_r).reshape(shape),
+        (out_c + out_r).reshape(shape),
+    )
+
+
+# ---------------------------------------------------------------------------
+# ReLU
+# ---------------------------------------------------------------------------
+
+def relu_propagate(
+    nominal_in,
+    nominal_out,
+    lower,
+    upper,
+    deriv_l,
+    deriv_u,
+    halfwidths,
+    abs_slack,
+    rel_slack,
+):
+    direct_l = torch.relu(lower)
+    direct_u = torch.relu(upper)
+
+    pos = lower >= 0
+    neg = upper <= 0
+    unstable = ~(pos | neg)
+
+    out_dl = torch.zeros_like(deriv_l)
+    out_du = torch.zeros_like(deriv_u)
+
+    pos_k = pos.unsqueeze(0)
+    unstable_k = unstable.unsqueeze(0)
+
+    out_dl = torch.where(pos_k, deriv_l, out_dl)
+    out_du = torch.where(pos_k, deriv_u, out_du)
+
+    # For an unstable ReLU, slope belongs to [0,1].  For any derivative
+    # interval [d_l,d_u], [0,1]*[d_l,d_u] is:
+    #   [min(0,d_l), max(0,d_u)].
+    unstable_l = torch.minimum(torch.zeros_like(deriv_l), deriv_l)
+    unstable_u = torch.maximum(torch.zeros_like(deriv_u), deriv_u)
+    out_dl = torch.where(unstable_k, unstable_l, out_dl)
+    out_du = torch.where(unstable_k, unstable_u, out_du)
+
+    out_dl, out_du = outward(
+        out_dl, out_du, abs_slack, rel_slack
+    )
+
+    out_l, out_u, radius = mvt_value_box(
+        nominal_out,
+        direct_l,
+        direct_u,
+        out_dl,
+        out_du,
+        halfwidths,
+        abs_slack,
+        rel_slack,
+    )
+
+    return out_l, out_u, out_dl, out_du, radius
+
+
+# ---------------------------------------------------------------------------
+# GroupNorm(1,C)
+# ---------------------------------------------------------------------------
+
+def groupnorm1_sensitivity(
+    gn,
+    nominal_in,
+    lower,
+    upper,
+    deriv_l,
+    deriv_u,
+    halfwidths,
+    abs_slack,
+    rel_slack,
+):
+    """Sound value+derivative intervals for GroupNorm(num_groups=1)."""
+    dims = (1, 2, 3)
+    deriv_dims = (2, 3, 4)
+
+    # Nominal statistics.
+    mean0 = nominal_in.mean(dim=dims, keepdim=True)
+    centered0 = nominal_in - mean0
+    var0 = (centered0 * centered0).mean(dim=dims, keepdim=True)
+
+    # Mean interval.
+    mean_l = lower.mean(dim=dims, keepdim=True)
+    mean_u = upper.mean(dim=dims, keepdim=True)
+    mean_l, mean_u = outward(
+        mean_l, mean_u, abs_slack, rel_slack
+    )
+
+    centered_l = lower - mean_u
+    centered_u = upper - mean_l
+    centered_l, centered_u = outward(
+        centered_l, centered_u, abs_slack, rel_slack
+    )
+
+    # Derivative of the mean.
+    dmean_l = deriv_l.mean(dim=deriv_dims, keepdim=True)
+    dmean_u = deriv_u.mean(dim=deriv_dims, keepdim=True)
+    dmean_l, dmean_u = outward(
+        dmean_l, dmean_u, abs_slack, rel_slack
+    )
+
+    dcenter_l = deriv_l - dmean_u
+    dcenter_u = deriv_u - dmean_l
+    dcenter_l, dcenter_u = outward(
+        dcenter_l, dcenter_u, abs_slack, rel_slack
+    )
+
+    # d Var / dq = (2/N) sum_i (x_i - mean) * dx_i/dq.
+    # The identity is exact because sum_i(x_i-mean)=0.
+    prod_l, prod_u = mul_interval(
+        centered_l.unsqueeze(0),
+        centered_u.unsqueeze(0),
+        deriv_l,
+        deriv_u,
+    )
+    dvar_l = 2.0 * prod_l.mean(dim=deriv_dims, keepdim=True)
+    dvar_u = 2.0 * prod_u.mean(dim=deriv_dims, keepdim=True)
+    dvar_l, dvar_u = outward(
+        dvar_l, dvar_u, abs_slack, rel_slack
+    )
+
+    # Direct variance upper bound from centered interval.
+    sq_max = torch.maximum(centered_l * centered_l, centered_u * centered_u)
+    var_u_direct = sq_max.mean(dim=dims, keepdim=True)
+
+    # Direct tight variance lower bound via convex 1-D minimization.
+    var_l_direct = min_variance_lower_bound(
+        lower.float(), upper.float(), iterations=80
+    ).to(dtype=lower.dtype)
+
+    # Derivative/MVT variance interval around nominal variance.
+    k = deriv_l.shape[0]
+    h = halfwidths.reshape(k, 1, 1, 1, 1)
+    var_radius = (
+        h * max_abs_interval(dvar_l, dvar_u)
+    ).sum(dim=0)
+
+    var_l_mvt = torch.clamp(var0 - var_radius, min=0.0)
+    var_u_mvt = var0 + var_radius
+
+    var_l = torch.maximum(var_l_direct, var_l_mvt)
+    var_u = torch.minimum(var_u_direct, var_u_mvt)
+    var_l, var_u = outward(
+        var_l, var_u, abs_slack, rel_slack
+    )
+    var_l = torch.clamp(var_l, min=0.0)
+    var_u = torch.maximum(var_u, var_l)
+
+    eps = float(gn.norm.eps)
+
+    # r = 1 / sqrt(var + eps), strictly positive.
+    r_l = torch.rsqrt(var_u + eps)
+    r_u = torch.rsqrt(var_l + eps)
+    r_l, r_u = outward(
+        r_l, r_u, abs_slack, rel_slack
+    )
+    r_l = torch.clamp(r_l, min=0.0)
+
+    # dr/dq = -0.5 * (var+eps)^(-3/2) * dvar/dq.
+    s_l = torch.pow(var_u + eps, -1.5)
+    s_u = torch.pow(var_l + eps, -1.5)
+    s_l, s_u = outward(
+        s_l, s_u, abs_slack, rel_slack
+    )
+
+    tmp_l, tmp_u = mul_interval(
+        dvar_l,
+        dvar_u,
+        s_l.unsqueeze(0),
+        s_u.unsqueeze(0),
+    )
+    dr_l, dr_u = scale_interval(tmp_l, tmp_u, -0.5)
+    dr_l, dr_u = outward(
+        dr_l, dr_u, abs_slack, rel_slack
+    )
+
+    # normalized = centered * r
+    norm_l, norm_u = mul_interval(
+        centered_l,
+        centered_u,
+        r_l,
+        r_u,
+    )
+    norm_l, norm_u = outward(
+        norm_l, norm_u, abs_slack, rel_slack
+    )
+
+    # d normalized = dcenter * r + centered * dr
+    term1_l, term1_u = mul_interval(
+        dcenter_l,
+        dcenter_u,
+        r_l.unsqueeze(0),
+        r_u.unsqueeze(0),
+    )
+    term2_l, term2_u = mul_interval(
+        centered_l.unsqueeze(0),
+        centered_u.unsqueeze(0),
+        dr_l,
+        dr_u,
+    )
+    dnorm_l, dnorm_u = add_interval(
+        term1_l, term1_u, term2_l, term2_u
+    )
+    dnorm_l, dnorm_u = outward(
+        dnorm_l, dnorm_u, abs_slack, rel_slack
+    )
+
+    gamma = gn.weight.view(1, -1, 1, 1).to(dtype=lower.dtype)
+    beta = gn.bias.view(1, -1, 1, 1).to(dtype=lower.dtype)
+
+    out_l, out_u = scale_interval(norm_l, norm_u, gamma)
+    out_l = out_l + beta
+    out_u = out_u + beta
+    out_l, out_u = outward(
+        out_l, out_u, abs_slack, rel_slack
+    )
+
+    dgamma = gamma.unsqueeze(0)
+    out_dl, out_du = scale_interval(
+        dnorm_l, dnorm_u, dgamma
+    )
+    out_dl, out_du = outward(
+        out_dl, out_du, abs_slack, rel_slack
+    )
+
+    nominal_out = gn(nominal_in)
+
+    # Tighten GroupNorm value bounds using the just-certified derivatives.
+    out_l, out_u, out_radius = mvt_value_box(
+        nominal_out,
+        out_l,
+        out_u,
+        out_dl,
+        out_du,
+        halfwidths,
+        abs_slack,
+        rel_slack,
+    )
+
+    stat = {
+        "variance_nominal": float(var0.min()),
+        "variance_lower_direct": float(var_l_direct.min()),
+        "variance_lower_mvt": float(var_l_mvt.min()),
+        "variance_lower_used": float(var_l.min()),
+        "variance_upper_used": float(var_u.max()),
+        "invstd_upper": float(r_u.max()),
+        "max_output_width": float((out_u - out_l).max()),
+        "mean_output_width": float((out_u - out_l).mean()),
+        "max_output_mvt_radius": float(out_radius.max()),
+    }
+
+    return nominal_out, out_l, out_u, out_dl, out_du, stat
+
+
 
 
 # ============================================================================
@@ -156,8 +959,8 @@ def exact_min_variance_box_1d(lower, upper, iterations=100):
     The objective is convex in scalar m.  Bisection solves its monotone
     derivative.  Returned value is slightly reduced for numerical safety.
     """
-    l = lower.reshape(-1).double()
-    u = upper.reshape(-1).double()
+    l = lower.detach().reshape(-1).double()
+    u = upper.detach().reshape(-1).double()
 
     if l.numel() == 0:
         raise RuntimeError("empty normalization group")
@@ -853,6 +1656,7 @@ def selected_pairwise_variance_combined_lower(
     return var_lb, len(pairs)
 
 
+
 def build_prior_crown(
     full_model,
     past_feat,
@@ -864,43 +1668,45 @@ def build_prior_crown(
     selected_pair_count,
     verbose=True,
 ):
-    """Build prior operations and all required CROWN intermediate bounds."""
-    if int(full_model.source_hidden.shape[1]) != 1:
-        raise NotImplementedError(
-            "This consolidated verifier currently targets the captured "
-            "one-incoming-edge scene only."
-        )
+    """Build the prior CROWN graph for any number of incoming target edges.
+
+    Only the target map feature is uncertain. Source-agent hidden vectors,
+    semantics, relative transforms, topology, and past features are fixed.
+
+    Multiple incoming messages are represented simultaneously and their
+    coordinate-wise max is expressed exactly at graph level with
+
+        max(a,b) = ReLU(a-b) + b.
+
+    The ReLUs are then relaxed by the same sound CROWN rules as the rest of
+    the prior graph.
+    """
+    K = int(full_model.source_hidden.shape[1])
+    if K < 1:
+        raise RuntimeError("Captured target has no incoming messages.")
 
     root_nom = feat_center.reshape(-1).double()
-
     ops = []
     cur_nom = root_nom.clone()
-
-    # Initial feature intervals are sound but are NOT used as an independent
-    # CROWN root after the first prior operation.  All later bounds are
-    # propagated directly to the four original map-pixel variables.
     cur_l = feat_l.reshape(-1).double()
     cur_u = feat_u.reshape(-1).double()
-
     diagnostics = []
 
     def recompute_bounds():
         nonlocal cur_l, cur_u
         dim = cur_nom.numel()
-
         cur_l, cur_u = combined_state_bounds_direct(
             ops,
             map_ctx,
             dim,
             map_spec_batch=map_spec_batch,
         )
-
-        # very small numerical pad
         cur_l = cur_l - (1e-12 + 1e-10 * cur_l.abs())
         cur_u = cur_u + (1e-12 + 1e-10 * cur_u.abs())
-
         if bool((cur_l > cur_u).any()):
-            raise RuntimeError("CROWN produced inverted prior intermediate bounds")
+            raise RuntimeError(
+                "CROWN produced inverted prior intermediate bounds"
+            )
 
     def append_affine(W, b, name):
         nonlocal cur_nom
@@ -940,7 +1746,8 @@ def build_prior_crown(
 
         direct_lb = float(
             exact_min_variance_box_1d(
-                cur_l[start:end], cur_u[start:end]
+                cur_l[start:end],
+                cur_u[start:end],
             )
         )
 
@@ -957,16 +1764,14 @@ def build_prior_crown(
             map_spec_batch=map_spec_batch,
         )
 
-        pair_lb, pair_used = (
-            selected_pairwise_variance_combined_lower(
-                ops,
-                map_ctx,
-                cur_nom,
-                start,
-                end,
-                pair_count=selected_pair_count,
-                map_spec_batch=map_spec_batch,
-            )
+        pair_lb, pair_used = selected_pairwise_variance_combined_lower(
+            ops,
+            map_ctx,
+            cur_nom,
+            start,
+            end,
+            pair_count=selected_pair_count,
+            map_spec_batch=map_spec_batch,
         )
 
         var_lb = max(
@@ -976,7 +1781,8 @@ def build_prior_crown(
         )
         var_ub = float(
             variance_upper_from_box(
-                cur_l[start:end], cur_u[start:end]
+                cur_l[start:end],
+                cur_u[start:end],
             )
         )
 
@@ -1039,7 +1845,6 @@ def build_prior_crown(
                 f"direct_lb={direct_lb:.8g}, "
                 f"pair_crown_lb={pair_lb:.8g}({pair_used} pairs), "
                 f"proj_crown_lb={projection_lb:.8g}, "
-                f"proj=[{projection_l:.6g},{projection_u:.6g}], "
                 f"used_lb={var_lb:.8g}, "
                 f"post_width={diag['max_width']:.8g}"
             )
@@ -1052,21 +1857,34 @@ def build_prior_crown(
                 b = (
                     layer.bias.detach().double()
                     if layer.bias is not None
-                    else torch.zeros(W.shape[0], dtype=torch.float64)
+                    else torch.zeros(
+                        W.shape[0],
+                        dtype=torch.float64,
+                    )
                 )
                 append_affine(W, b, name)
             elif isinstance(layer, nn.LayerNorm):
-                append_norm(layer, 0, cur_nom.numel(), name)
+                append_norm(
+                    layer,
+                    0,
+                    cur_nom.numel(),
+                    name,
+                )
             elif isinstance(layer, nn.ReLU):
-                append_relu(0, cur_nom.numel(), name)
+                append_relu(
+                    0,
+                    cur_nom.numel(),
+                    name,
+                )
             else:
                 raise NotImplementedError(
-                    f"{prefix}: unsupported layer {type(layer).__name__}"
+                    f"{prefix}: unsupported layer "
+                    f"{type(layer).__name__}"
                 )
 
     # ------------------------------------------------------------------
-    # prior_mlp_in. Input order:
-    # [past64, map64, semantic2].
+    # Target prior_mlp_in.
+    # Input [past64, map64, sem2]; only map64 is variable.
     # ------------------------------------------------------------------
     pin = list(full_model.prior_mlp_in)
     if not pin or not isinstance(pin[0], nn.Linear):
@@ -1080,163 +1898,322 @@ def build_prior_crown(
         root_nom,
         sem_t,
     ])
-    if full_input.numel() != pin[0].in_features:
-        raise RuntimeError(
-            f"prior_mlp_in input mismatch: {full_input.numel()} "
-            f"vs {pin[0].in_features}"
-        )
-
     map_start = past.numel()
     map_end = map_start + root_nom.numel()
     variable_idx = list(range(map_start, map_end))
 
     Wvar, beff = _fold_linear_with_constants(
-        pin[0], variable_idx, full_input
+        pin[0],
+        variable_idx,
+        full_input,
     )
-    append_affine(Wvar, beff, "prior_mlp_in[0]")
-    append_whole_layers(pin[1:], "prior_mlp_in_tail")
+    append_affine(
+        Wvar,
+        beff,
+        "prior_mlp_in[0]",
+    )
+    append_whole_layers(
+        pin[1:],
+        "prior_mlp_in_tail",
+    )
 
-    h_dim = cur_nom.numel()
+    h_dim = int(cur_nom.numel())
     h_nom = cur_nom.clone()
 
     # ------------------------------------------------------------------
-    # Edge MLP. Input:
-    # [h_i, h_j_fixed, sem_i, sem_j, rel_trans].
-    # Retain h in state while evaluating message: state becomes [h,msg].
+    # Evaluate every incoming edge MLP in parallel while retaining h.
+    # State after initialization:
+    #     [h, msg_0, msg_1, ..., msg_(K-1)]
     # ------------------------------------------------------------------
     edge = list(full_model.edge_mlp)
     if not edge or not isinstance(edge[0], nn.Linear):
         raise RuntimeError("edge_mlp must start with Linear")
 
-    src = full_model.source_hidden.reshape(-1).double()
-    sem_s = full_model.sem_sources.reshape(-1).double()
-    rel = full_model.rel_trans.reshape(-1).double()
+    srcs = full_model.source_hidden[0].double()
+    sem_sources = full_model.sem_sources[0].double()
+    rels = full_model.rel_trans[0].double()
 
-    edge_full = torch.cat([
-        h_nom,
-        src,
-        sem_t,
-        sem_s,
-        rel,
-    ])
-    if edge_full.numel() != edge[0].in_features:
+    if not (
+        srcs.shape[0] == K
+        and sem_sources.shape[0] == K
+        and rels.shape[0] == K
+    ):
         raise RuntimeError(
-            f"edge_mlp input mismatch: {edge_full.numel()} "
-            f"vs {edge[0].in_features}"
+            "Incoming-edge buffer count mismatch."
         )
 
-    hedge_idx = list(range(h_dim))
-    Wedge_h, bedge = _fold_linear_with_constants(
-        edge[0], hedge_idx, edge_full
-    )
-    msg_dim = Wedge_h.shape[0]
+    Wedge_blocks = []
+    bedge_blocks = []
+
+    for j in range(K):
+        edge_full = torch.cat([
+            h_nom,
+            srcs[j].reshape(-1),
+            sem_t,
+            sem_sources[j].reshape(-1),
+            rels[j].reshape(-1),
+        ])
+
+        hedge_idx = list(range(h_dim))
+        Wedge_h, bedge = _fold_linear_with_constants(
+            edge[0],
+            hedge_idx,
+            edge_full,
+        )
+        Wedge_blocks.append(Wedge_h)
+        bedge_blocks.append(bedge)
+
+    msg_dim = int(Wedge_blocks[0].shape[0])
+    state_dim = h_dim + K * msg_dim
 
     Wstate = torch.zeros(
-        h_dim + msg_dim,
+        state_dim,
         h_dim,
         dtype=torch.float64,
     )
-    Wstate[:h_dim, :] = torch.eye(h_dim, dtype=torch.float64)
-    Wstate[h_dim:, :] = Wedge_h
+    Wstate[:h_dim, :] = torch.eye(
+        h_dim,
+        dtype=torch.float64,
+    )
+    for j, Wj in enumerate(Wedge_blocks):
+        r0 = h_dim + j * msg_dim
+        r1 = r0 + msg_dim
+        Wstate[r0:r1, :] = Wj
 
-    bstate = torch.cat([
-        torch.zeros(h_dim, dtype=torch.float64),
-        bedge,
-    ])
-    append_affine(Wstate, bstate, "edge_state_init")
+    bstate = torch.cat(
+        [
+            torch.zeros(h_dim, dtype=torch.float64),
+            *bedge_blocks,
+        ]
+    )
+    append_affine(
+        Wstate,
+        bstate,
+        "edge_state_init_all",
+    )
 
-    edge_slice_start = h_dim
-    edge_slice_end = h_dim + msg_dim
-
+    # Remaining edge MLP layers are shared across each message block.
     for idx, layer in enumerate(edge[1:], start=1):
         name = f"edge_mlp[{idx}]"
 
         if isinstance(layer, nn.Linear):
-            old_msg_dim = edge_slice_end - edge_slice_start
-            new_msg_dim = layer.out_features
+            old_m = msg_dim
+            new_m = int(layer.out_features)
+
+            old_dim = h_dim + K * old_m
+            new_dim = h_dim + K * new_m
 
             W = torch.zeros(
-                h_dim + new_msg_dim,
-                h_dim + old_msg_dim,
+                new_dim,
+                old_dim,
                 dtype=torch.float64,
             )
-            W[:h_dim, :h_dim] = torch.eye(h_dim, dtype=torch.float64)
-            W[h_dim:, h_dim:] = layer.weight.detach().double()
+            W[:h_dim, :h_dim] = torch.eye(
+                h_dim,
+                dtype=torch.float64,
+            )
 
-            b = torch.cat([
-                torch.zeros(h_dim, dtype=torch.float64),
-                (
-                    layer.bias.detach().double()
-                    if layer.bias is not None
-                    else torch.zeros(new_msg_dim, dtype=torch.float64)
-                ),
-            ])
-            append_affine(W, b, name)
+            bias_parts = [
+                torch.zeros(
+                    h_dim,
+                    dtype=torch.float64,
+                )
+            ]
 
-            edge_slice_start = h_dim
-            edge_slice_end = h_dim + new_msg_dim
+            for j in range(K):
+                ro = h_dim + j * new_m
+                co = h_dim + j * old_m
+                W[
+                    ro:ro + new_m,
+                    co:co + old_m,
+                ] = layer.weight.detach().double()
+                bias_parts.append(
+                    (
+                        layer.bias.detach().double()
+                        if layer.bias is not None
+                        else torch.zeros(
+                            new_m,
+                            dtype=torch.float64,
+                        )
+                    )
+                )
+
+            append_affine(
+                W,
+                torch.cat(bias_parts),
+                name + "_all_edges",
+            )
+            msg_dim = new_m
 
         elif isinstance(layer, nn.LayerNorm):
-            append_norm(
-                layer,
-                edge_slice_start,
-                edge_slice_end,
-                name,
-            )
+            for j in range(K):
+                s = h_dim + j * msg_dim
+                append_norm(
+                    layer,
+                    s,
+                    s + msg_dim,
+                    f"{name}_edge{j}",
+                )
+
         elif isinstance(layer, nn.ReLU):
-            append_relu(
-                edge_slice_start,
-                edge_slice_end,
-                name,
-            )
+            for j in range(K):
+                s = h_dim + j * msg_dim
+                append_relu(
+                    s,
+                    s + msg_dim,
+                    f"{name}_edge{j}",
+                )
+
         else:
             raise NotImplementedError(
-                f"edge_mlp: unsupported {type(layer).__name__}"
+                f"edge_mlp: unsupported "
+                f"{type(layer).__name__}"
             )
 
-    msg_dim = edge_slice_end - edge_slice_start
+    # ------------------------------------------------------------------
+    # Exact graph-level coordinate-wise max reduction.
+    #
+    # Current state:
+    #     [h, current, next, remaining...]
+    #
+    # Each reduction uses:
+    #     d = current - next
+    #     current = ReLU(d) + next
+    # ------------------------------------------------------------------
+    remaining = K
+
+    while remaining > 1:
+        old_dim = h_dim + remaining * msg_dim
+
+        # [h, cur, next, rest] -> [h, d=cur-next, next, rest]
+        W1 = torch.zeros(
+            old_dim,
+            old_dim,
+            dtype=torch.float64,
+        )
+        W1[:h_dim, :h_dim] = torch.eye(
+            h_dim,
+            dtype=torch.float64,
+        )
+
+        cur0 = h_dim
+        nxt0 = h_dim + msg_dim
+
+        W1[
+            cur0:cur0 + msg_dim,
+            cur0:cur0 + msg_dim,
+        ] = torch.eye(msg_dim, dtype=torch.float64)
+        W1[
+            cur0:cur0 + msg_dim,
+            nxt0:nxt0 + msg_dim,
+        ] = -torch.eye(msg_dim, dtype=torch.float64)
+
+        # Preserve next and all later message blocks.
+        W1[
+            nxt0:,
+            nxt0:,
+        ] = torch.eye(
+            old_dim - nxt0,
+            dtype=torch.float64,
+        )
+
+        append_affine(
+            W1,
+            torch.zeros(old_dim, dtype=torch.float64),
+            f"max_reduce_{K-remaining}_difference",
+        )
+
+        append_relu(
+            cur0,
+            cur0 + msg_dim,
+            f"max_reduce_{K-remaining}_relu",
+        )
+
+        # [h, relu(d), next, rest] -> [h, max, rest]
+        new_dim = h_dim + (remaining - 1) * msg_dim
+        W2 = torch.zeros(
+            new_dim,
+            old_dim,
+            dtype=torch.float64,
+        )
+        W2[:h_dim, :h_dim] = torch.eye(
+            h_dim,
+            dtype=torch.float64,
+        )
+
+        W2[
+            cur0:cur0 + msg_dim,
+            cur0:cur0 + msg_dim,
+        ] = torch.eye(msg_dim, dtype=torch.float64)
+        W2[
+            cur0:cur0 + msg_dim,
+            nxt0:nxt0 + msg_dim,
+        ] = torch.eye(msg_dim, dtype=torch.float64)
+
+        rest_in = nxt0 + msg_dim
+        rest_out = cur0 + msg_dim
+        if rest_in < old_dim:
+            W2[
+                rest_out:,
+                rest_in:,
+            ] = torch.eye(
+                old_dim - rest_in,
+                dtype=torch.float64,
+            )
+
+        append_affine(
+            W2,
+            torch.zeros(new_dim, dtype=torch.float64),
+            f"max_reduce_{K-remaining}_combine",
+        )
+
+        remaining -= 1
+
+    # Final state is [h, aggregated_message].
+    if int(cur_nom.numel()) != h_dim + msg_dim:
+        raise RuntimeError(
+            "Unexpected state dimension after max reduction."
+        )
 
     # ------------------------------------------------------------------
-    # Update MLP. Input [h,msg,sem_t].
-    # With one incoming edge, coordinate-wise max is identity.
+    # Update MLP: [h, aggregated_message, sem_target].
     # ------------------------------------------------------------------
     upd = list(full_model.update_mlp)
     if not upd or not isinstance(upd[0], nn.Linear):
         raise RuntimeError("update_mlp must start with Linear")
 
-    state_nom = cur_nom
     upd_full = torch.cat([
-        state_nom[:h_dim],
-        state_nom[edge_slice_start:edge_slice_end],
+        cur_nom,
         sem_t,
     ])
-    if upd_full.numel() != upd[0].in_features:
-        raise RuntimeError(
-            f"update_mlp input mismatch: {upd_full.numel()} "
-            f"vs {upd[0].in_features}"
-        )
+    variable_idx = list(range(cur_nom.numel()))
 
-    variable_idx = list(range(h_dim + msg_dim))
     Wupd, bupd = _fold_linear_with_constants(
-        upd[0], variable_idx, upd_full
+        upd[0],
+        variable_idx,
+        upd_full,
     )
-    append_affine(Wupd, bupd, "update_mlp[0]")
-    append_whole_layers(upd[1:], "update_mlp_tail")
+    append_affine(
+        Wupd,
+        bupd,
+        "update_mlp[0]",
+    )
+    append_whole_layers(
+        upd[1:],
+        "update_mlp_tail",
+    )
 
-    # ------------------------------------------------------------------
     # Output MLP.
-    # ------------------------------------------------------------------
-    pout = list(full_model.prior_mlp_out)
-    append_whole_layers(pout, "prior_mlp_out")
+    append_whole_layers(
+        list(full_model.prior_mlp_out),
+        "prior_mlp_out",
+    )
 
     if cur_nom.numel() != 64:
         raise RuntimeError(
             f"Expected 64 prior outputs, got {cur_nom.numel()}"
         )
 
-    # v3.1 note: prior intermediate bounds are rooted directly in map_ctx's
-    # original map-patch variables.  There is intentionally no root_l/root_u
-    # feature-box root here.
     return {
         "ops": ops,
         "root_nom": root_nom,
@@ -1244,6 +2221,7 @@ def build_prior_crown(
         "output_l": cur_l,
         "output_u": cur_u,
         "diagnostics": diagnostics,
+        "incoming_edges": K,
     }
 
 
@@ -1961,10 +2939,10 @@ def build_map_crown_context(
 
     feature = enc.feature
     feat_nom = feature(nominal_flat)
-    feat_l, feat_u = map_linear_value_interval(
+    feat_l, feat_u = linear_value_interval(
         feature, lower_flat, upper_flat
     )
-    dfeat_l, dfeat_u = map_linear_deriv_interval(
+    dfeat_l, dfeat_u = linear_deriv_interval(
         feature, dflat_l, dflat_u
     )
 
@@ -2198,7 +3176,16 @@ def output_name(i):
     return f"mu_{i}" if i < 32 else f"logvar_{i-32}"
 
 
-def main(args):
+def main(args, mode="generalized"):
+    if mode not in {"non-generalized", "generalized"}:
+        raise ValueError(f"Unknown D2 mode: {mode}")
+
+    if mode == "non-generalized" and int(args.patch_size) != 1:
+        raise ValueError(
+            "D2 non-generalized is defined as exactly one spatial map "
+            "location across all four channels, so patch_size must be 1."
+        )
+
     torch.set_num_threads(args.threads)
 
     cap = torch.load(
@@ -2208,12 +3195,6 @@ def main(args):
     )
     full_model, incoming, _ = build_model(args.ckpt, cap)
     full_model = full_model.double().eval()
-
-    if int(incoming.numel()) != 1:
-        raise NotImplementedError(
-            f"Current consolidated verifier expects one incoming edge; "
-            f"capture has {incoming.numel()}."
-        )
 
     past0 = cap["target_past_input"].reshape(1, -1).double()
     map0 = cap["target_map_obs"].unsqueeze(0).double()
@@ -2262,7 +3243,7 @@ def main(args):
     )
 
     print("=" * 80)
-    print("STRIVE STAGE D2-GENERALIZED PATCH LATE-MAP CROWN TIGHTENING")
+    print("STRIVE STAGE D2 " + ("NON-GENERALIZED" if mode == "non-generalized" else "GENERALIZED") + " MAP CROWN")
     print("=" * 80)
     print(f"target agent              : {target}")
     print(f"incoming edges            : {incoming.numel()}")
@@ -2404,8 +3385,10 @@ def main(args):
                 full_model,
                 past_feat,
                 map0,
-                row,
-                col,
+                row0,
+                row1,
+                col0,
+                col1,
                 full_nominal.float(),
                 args,
                 verbose=False,
@@ -2504,7 +3487,7 @@ def main(args):
         status = "NO_VERIFICATION_RESULT"
 
     print("\n" + "=" * 80)
-    print("FINAL STAGE D2-GENERALIZED PATCH LATE-MAP CROWN TIGHTENING RESULT")
+    print("FINAL STRIVE STAGE D2 " + ("NON-GENERALIZED" if mode == "non-generalized" else "GENERALIZED") + " RESULT")
     print("=" * 80)
     print(f"status                     : {status}")
     print(f"evaluated BaB nodes        : {evaluated}")
@@ -2558,7 +3541,7 @@ def main(args):
         serial_terminal.append(item)
 
     result = {
-        "stage": "D2-generalized-map-patch-late-map-crown-tightening",
+        "stage": ("D2-non-generalized-map-pixel" if mode == "non-generalized" else "D2-generalized-map-patch"),
         "status": status,
         "scope": {
             "target_agent": target,
@@ -2575,7 +3558,7 @@ def main(args):
                 "semantic class",
                 "graph topology",
                 "relative poses",
-                "all non-target agents",
+                "all non-target agents and their map/past inputs",
                 "all map pixels outside the selected patch",
             ],
         },
@@ -2631,13 +3614,14 @@ def main(args):
     return 3
 
 
-if __name__ == "__main__":
+
+def make_parser(default_patch_size=3, default_out_prefix="prior_stage_d2_generalized"):
     p = argparse.ArgumentParser()
 
     p.add_argument("--ckpt", required=True)
     p.add_argument("--capture", required=True)
 
-    p.add_argument("--epsilon", type=float, default=0.001)
+    p.add_argument("--epsilon", type=float, default=0.0001)
     p.add_argument("--delta", type=float, default=0.05)
 
     p.add_argument("--row", type=int, default=None)
@@ -2645,11 +3629,14 @@ if __name__ == "__main__":
     p.add_argument(
         "--patch-size",
         type=int,
-        default=3,
-        help="Odd square patch side length; default 3 gives 36 uncertain values.",
+        default=default_patch_size,
+        help=(
+            "Odd square patch side length. Generalized D2 defaults to 3 "
+            "(36 uncertain raster values). Non-generalized D2 fixes this to 1 "
+            "(4 uncertain values)."
+        ),
     )
 
-    # Start modestly.  If root is not certified, the same command can split.
     p.add_argument("--max-depth", type=int, default=0)
     p.add_argument("--max-nodes", type=int, default=1)
 
@@ -2674,12 +3661,19 @@ if __name__ == "__main__":
 
     p.add_argument(
         "--out-json",
-        default="prior_stage_d2_generalized_patch_late_crown.json",
+        default=default_out_prefix + ".json",
     )
     p.add_argument(
         "--out-csv",
-        default="prior_stage_d2_generalized_patch_late_crown.csv",
+        default=default_out_prefix + ".csv",
     )
+    return p
 
-    args = p.parse_args()
-    raise SystemExit(main(args))
+
+if __name__ == "__main__":
+    parser = make_parser(
+        default_patch_size=3,
+        default_out_prefix="prior_stage_d2_generalized",
+    )
+    args = parser.parse_args()
+    raise SystemExit(main(args, mode="generalized"))

@@ -20,7 +20,7 @@ def load_original_prior_head(ckpt_file):
         nn.Linear(128, 64),
     )
     # WARNING: Load only checkpoints you trust; old checkpoints may contain unsafe pickles.
-    raw = torch.load(ckpt_file, map_location='cpu', weights_only=True)
+    raw = torch.load(ckpt_file, map_location='cpu')
     state = raw.get('model', raw.get('state_dict', raw))
     prefix = 'prior_net.mlp_out.net.'
     sub = {key[len(prefix):]: tensor for key, tensor in state.items()
@@ -36,7 +36,7 @@ def verify(checkpoint, capture, epsilon=1e-3, delta=0.05,
     if not (epsilon > 0 and delta > 0):
         raise ValueError('epsilon and delta must be positive')
     head = load_original_prior_head(checkpoint)
-    record = torch.load(capture, map_location='cpu', weights_only=True)
+    record = torch.load(capture, map_location='cpu')
     h0 = record['hidden'].reshape(1, 128).float()
     recorded = record['original_output'].reshape(1, 64).float()
     with torch.no_grad():
