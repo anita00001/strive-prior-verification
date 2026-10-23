@@ -312,7 +312,7 @@ The run should create `prior_stage_c_capture.pt` in the `strive-prior-verificati
 # from capture_prior_head import attach_capture
 # from capture_prior_stage_b import attach_stage_b_capture
 # from capture_prior_stage_c import attach_stage_c_capture
-from capture_prior_stage_d import capture_stage_d_if_match
+from capture_prior_stage_d import capture_stage_d
 ```
 
 2. In STRIVE, open `src/test_traffic.py` and locate `run_one_epoch()`
@@ -320,14 +320,11 @@ Immediately below `pred = model(scene_graph, map_idx, map_env, use_post_mean=Tru
 
 And before `loss_dict = loss_fn(scene_graph, pred)`, temporarily add a capture call:
 ```bash
-    capture_stage_d_if_match(
+    capture_stage_d(
         model,
         scene_graph,
         map_idx,
         map_env,
-        reference_capture=os.path.expanduser(
-            "~/formal-verification-workspace/strive-prior-verification/prior_stage_c_capture.pt"
-        ),
         output_capture=os.path.expanduser(
             "~/formal-verification-workspace/strive-prior-verification/prior_stage_d_capture.pt"
         ),
