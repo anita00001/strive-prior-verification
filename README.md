@@ -306,10 +306,35 @@ The run should create `prior_stage_c_capture.pt` in the `strive-prior-verificati
 
 ---
 
-### 3.3 Attach the capture hook for Stage C
-1. In STRIVE, open `src/test_traffic.py` and locate `model.eval()`
-Immediately below `model.eval()`, before `with torch.no_grad():`, temporarily replace the old capture call with:
+### 3.4 Attach the capture hook for Stage D
+1. In STRIVE, open `src/test_traffic.py` and import
+```bash
+# from capture_prior_head import attach_capture
+# from capture_prior_stage_b import attach_stage_b_capture
+# from capture_prior_stage_c import attach_stage_c_capture
+from capture_prior_stage_d import capture_stage_d_if_match
+```
 
+2. In STRIVE, open `src/test_traffic.py` and locate `run_one_epoch()`
+Immediately below `pred = model(scene_graph, map_idx, map_env, use_post_mean=True)`,
+
+And before `loss_dict = loss_fn(scene_graph, pred)`, temporarily add a capture call:
+```bash
+    capture_stage_d_if_match(
+        model,
+        scene_graph,
+        map_idx,
+        map_env,
+        reference_capture=os.path.expanduser(
+            "~/formal-verification-workspace/strive-prior-verification/prior_stage_c_capture.pt"
+        ),
+        output_capture=os.path.expanduser(
+            "~/formal-verification-workspace/strive-prior-verification/prior_stage_d_capture.pt"
+        ),
+    )
+```
+
+3. Immediately below `model.eval()`, before `with torch.no_grad():`, comment out all other capture calls:
 ```bash
     # from capture_prior_head import attach_capture
 
@@ -337,17 +362,9 @@ Immediately below `model.eval()`, before `with torch.no_grad():`, temporarily re
     #          "~/formal-verification-workspace/strive-prior-verification/prior_stage_c_capture.pt"
     #     )
     # )
-
-    from capture_prior_stage_d import attach_stage_d_capture
-
-    attach_stage_d_capture(
-        model,
-         os.path.expanduser(
-              "~/formal-verification-workspace/strive-prior-verification/prior_stage_d_capture.pt"
-        )
-    )
 ```
-2. Run
+
+4. Run
 ```bash
 bash run_prior_capture.sh
 ```
