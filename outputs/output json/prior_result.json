@@ -1,0 +1,25 @@
+{
+  "component": "Original pretrained prior_net.mlp_out (MLP incl. LayerNorm)",
+  "input_space": "Independent Linf perturbation of captured 128-D hidden activation",
+  "checkpoint_sha256": "f977360762b7c2f8d66745fb781b1d1a66c4963a5d48a47bc2ca7646861088cf",
+  "epsilon": 0.001,
+  "delta": 0.05,
+  "method": "backward",
+  "scope_warning": "No claim about complete prior GNN, map encoder, decoder, or vehicle safety",
+  "outputs": {
+    "mu_0": {
+      "nominal": 0.2672806978225708,
+      "certified_lower": 0.2660484313964844,
+      "certified_upper": 0.2685156464576721,
+      "allowed_deviation": 0.05,
+      "verdict": "CERTIFIED"
+    },
+    "logvar_0": {
+      "nominal": -3.391317844390869,
+      "certified_lower": -3.3933815956115723,
+      "certified_upper": -3.389296770095825,
+      "allowed_deviation": 0.05,
+      "verdict": "CERTIFIED"
+    }
+  }
+}
